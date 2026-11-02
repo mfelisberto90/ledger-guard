@@ -2,6 +2,7 @@
 name = "ledger-guard"
 version = "0.1.0"
 description = "Hexagonal Python 3.12 commercial order pricing, exact Fraction margin-approval engine & multi-tenant security reference (PostgreSQL 17 FORCE RLS, FastAPI, MCP tools)"
+readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [
