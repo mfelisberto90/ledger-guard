@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality-and-security:
+    name: Python 3.12 Lint, Strict Typing, Security Invariants & Pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync locked dependencies
+        run: uv sync --frozen --dev
+
+      - name: Ruff lint & security rules
+        run: uv run ruff check src tests scripts
+
+      - name: Mypy strict static typing
+        run: uv run mypy --strict src
+
+      - name: Architectural & security invariant linter
+        run: uv run python3 scripts/security-lint.py
+
+      - name: Pytest suite
+        run: uv run pytest -v
