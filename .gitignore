@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments & packaging
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Type checking, linting & test caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environment secrets (never commit)
+.env
+.env.*
+*.pem
+*.key
+*.p12
