@@ -3,6 +3,7 @@
 [![CI](https://github.com/mfelisberto90/ledger-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/mfelisberto90/ledger-guard/actions/workflows/ci.yml)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-green.svg)](./LICENSE)
+[![M8ven Score](https://m8ven.ai/badge/mcp/mfelisberto90-ledger-guard-b5gzoa?v=303cad183b11d1fa0d6c188eb82283f7)](https://m8ven.ai/mcp/mfelisberto90-ledger-guard-b5gzoa?s=readme)
 
 Binary floats silently wreck commercial ledgers. If you round a 3-bottle case split (`1/3` unit ratio) too early, you'll leak a penny on every single order, and if your AI tool endpoints return raw ORM rows, you'll hand confidential supplier costs to staff who shouldn't see them.
 
