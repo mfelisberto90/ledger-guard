@@ -14,46 +14,164 @@ from ledger_guard.domain.money import Currency, require_strict_int
 from ledger_guard.security.idempotency import IdempotencyCoordinator
 from ledger_guard.security.redaction import Redactor
 
+SERVER_VERSION: str = "0.2.0"
+DEFAULT_MCP_PROTOCOL_VERSION: str = "2025-03-26"
+SUPPORTED_MCP_PROTOCOL_VERSIONS: frozenset[str] = frozenset(
+    {
+        "2025-06-18",
+        "2025-03-26",
+        "2024-11-05",
+    }
+)
+
+_CREATE_ORDER_KEYS: frozenset[str] = frozenset(
+    {
+        "idempotency_key",
+        "customer_ref",
+        "order_kind",
+        "currency",
+        "header_discount_bps",
+        "header_discount_minor",
+        "passthrough_freight_minor",
+        "small_order_surcharge_minor",
+        "lines",
+    }
+)
+_CREATE_ORDER_LINE_KEYS: frozenset[str] = frozenset(
+    {
+        "sku",
+        "quantity",
+        "unit_price_minor",
+        "manual_discount_bps",
+    }
+)
+_GET_ORDER_KEYS: frozenset[str] = frozenset({"order_id"})
+_LIST_ORDERS_KEYS: frozenset[str] = frozenset({"limit"})
+_CONFIRM_ORDER_KEYS: frozenset[str] = frozenset(
+    {"idempotency_key", "order_id", "expected_version"}
+)
+_APPROVE_MARGIN_KEYS: frozenset[str] = frozenset(
+    {"idempotency_key", "order_id", "expected_version", "reason"}
+)
+_AMEND_ORDER_LINE_KEYS: frozenset[str] = frozenset(
+    {
+        "idempotency_key",
+        "order_id",
+        "line_id",
+        "expected_version",
+        "quantity",
+        "unit_price_minor",
+        "manual_discount_bps",
+        "header_discount_bps",
+        "header_discount_minor",
+    }
+)
+_EXPORT_ORDERS_CSV_KEYS: frozenset[str] = frozenset()
+
 MCP_TOOLS_SPEC: tuple[dict[str, Any], ...] = (
     {
         "name": "create_order",
+        "title": "Create Governed Order",
         "description": (
-            "Price and create a commercial order using exact Fraction UoM arithmetic "
-            "and tenant margin-floor governance."
+            "Price and create a tenant-scoped B2B sales order using exact Fraction UoM "
+            "arithmetic, immutable inventory CostSnapshots, and margin-floor governance. "
+            "Requires capability 'orders:write'."
         ),
+        "annotations": {
+            "title": "Create Governed Order",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "required": ["idempotency_key", "customer_ref", "currency", "lines"],
             "properties": {
-                "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
-                "customer_ref": {"type": "string", "minLength": 1, "maxLength": 128},
+                "idempotency_key": {
+                    "type": "string",
+                    "minLength": 8,
+                    "maxLength": 128,
+                    "description": "Unique client mutation key bound to payload SHA-256.",
+                },
+                "customer_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Buyer purchase order reference or account code.",
+                },
                 "order_kind": {
                     "type": "string",
                     "enum": [k.value for k in OrderKind],
                     "default": "standard",
+                    "description": "Commercial order classification.",
                 },
-                "currency": {"type": "string", "enum": [c.value for c in Currency]},
-                "header_discount_bps": {"type": "integer", "minimum": 0, "maximum": 10000},
-                "header_discount_minor": {"type": "integer", "minimum": 0},
-                "passthrough_freight_minor": {"type": "integer", "minimum": 0},
-                "small_order_surcharge_minor": {"type": "integer", "minimum": 0},
+                "currency": {
+                    "type": "string",
+                    "enum": [c.value for c in Currency],
+                    "description": "ISO 4217 currency code.",
+                },
+                "header_discount_bps": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Proportional header discount in basis points (100 bps = 1%).",
+                },
+                "header_discount_minor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Fixed header discount in integer minor currency units.",
+                },
+                "passthrough_freight_minor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Pass-through carrier freight in minor units "
+                        "(excluded from margin basis)."
+                    ),
+                },
+                "small_order_surcharge_minor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Small-order surcharge in minor units (excluded from margin basis)."
+                    ),
+                },
                 "lines": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 200,
+                    "description": "Commercial order lines to price.",
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
                         "required": ["sku", "quantity"],
                         "properties": {
-                            "sku": {"type": "string"},
-                            "quantity": {"type": ["integer", "string"]},
-                            "unit_price_minor": {"type": "integer", "minimum": 0},
+                            "sku": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "description": "Catalog SKU identifier.",
+                            },
+                            "quantity": {
+                                "type": ["integer", "string"],
+                                "description": (
+                                    "Positive integer or exact rational string (e.g. '3/2')."
+                                ),
+                            },
+                            "unit_price_minor": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": (
+                                    "Optional selling unit price override in minor units."
+                                ),
+                            },
                             "manual_discount_bps": {
                                 "type": "integer",
                                 "minimum": 0,
                                 "maximum": 10000,
+                                "description": "Optional manual line discount in basis points.",
                             },
                         },
                     },
@@ -63,63 +181,229 @@ MCP_TOOLS_SPEC: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "get_order",
-        "description": "Fetch a tenant-scoped order with capability-projected cost/margin fields.",
+        "title": "Get Order",
+        "description": (
+            "Fetch a single tenant-scoped sales order with capability-projected cost and "
+            "margin fields. Requires capability 'orders:read'."
+        ),
+        "annotations": {
+            "title": "Get Order",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "required": ["order_id"],
             "properties": {
-                "order_id": {"type": "string", "format": "uuid"},
+                "order_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Target order UUID within the caller's tenant.",
+                },
+            },
+        },
+    },
+    {
+        "name": "list_orders",
+        "title": "List Orders",
+        "description": (
+            "List recent tenant-scoped sales orders with capability-projected cost and "
+            "margin fields stripped according to caller permissions. Requires 'orders:read'."
+        ),
+        "annotations": {
+            "title": "List Orders",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50,
+                    "description": "Maximum number of orders to return (1..200).",
+                },
             },
         },
     },
     {
         "name": "confirm_order",
-        "description": "Confirm an order when readiness gates evaluate to met=true.",
+        "title": "Confirm Order",
+        "description": (
+            "Confirm a governed sales order when all readiness gates evaluate to met=true. "
+            "Requires capability 'orders:confirm' and matching optimistic expected_version."
+        ),
+        "annotations": {
+            "title": "Confirm Order",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "required": ["idempotency_key", "order_id", "expected_version"],
             "properties": {
-                "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
-                "order_id": {"type": "string", "format": "uuid"},
-                "expected_version": {"type": "integer", "minimum": 1},
+                "idempotency_key": {
+                    "type": "string",
+                    "minLength": 8,
+                    "maxLength": 128,
+                    "description": "Unique client mutation key bound to payload SHA-256.",
+                },
+                "order_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Target order UUID to confirm.",
+                },
+                "expected_version": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optimistic concurrency aggregate version.",
+                },
             },
         },
     },
     {
         "name": "approve_margin",
-        "description": "Record a four-eyes margin exception approval with mandatory reason.",
+        "title": "Approve Margin Exception",
+        "description": (
+            "Record an append-only four-eyes margin exception approval with mandatory reason. "
+            "Approver must hold 'orders:margin:approve' and be distinct from creator/amender."
+        ),
+        "annotations": {
+            "title": "Approve Margin Exception",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "required": ["idempotency_key", "order_id", "expected_version", "reason"],
             "properties": {
-                "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
-                "order_id": {"type": "string", "format": "uuid"},
-                "expected_version": {"type": "integer", "minimum": 1},
-                "reason": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "idempotency_key": {
+                    "type": "string",
+                    "minLength": 8,
+                    "maxLength": 128,
+                    "description": "Unique client mutation key bound to payload SHA-256.",
+                },
+                "order_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Target order UUID awaiting margin exception approval.",
+                },
+                "expected_version": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optimistic concurrency aggregate version.",
+                },
+                "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "description": "Commercial justification recorded in the audit trail.",
+                },
             },
         },
     },
     {
         "name": "amend_order_line",
-        "description": "Amend order line commercial pricing and re-evaluate margin floor gates.",
+        "title": "Amend Order Line",
+        "description": (
+            "Amend commercial pricing or quantity on an existing order line while preserving "
+            "immutable CostSnapshots and re-evaluating margin floor gates. Requires 'orders:write'."
+        ),
+        "annotations": {
+            "title": "Amend Order Line",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "required": ["idempotency_key", "order_id", "line_id", "expected_version"],
             "properties": {
-                "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
-                "order_id": {"type": "string", "format": "uuid"},
-                "line_id": {"type": "string", "format": "uuid"},
-                "expected_version": {"type": "integer", "minimum": 1},
-                "quantity": {"type": ["integer", "string"]},
-                "unit_price_minor": {"type": "integer", "minimum": 0},
-                "manual_discount_bps": {"type": "integer", "minimum": 0, "maximum": 10000},
-                "header_discount_bps": {"type": "integer", "minimum": 0, "maximum": 10000},
-                "header_discount_minor": {"type": "integer", "minimum": 0},
+                "idempotency_key": {
+                    "type": "string",
+                    "minLength": 8,
+                    "maxLength": 128,
+                    "description": "Unique client mutation key bound to payload SHA-256.",
+                },
+                "order_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Target order UUID.",
+                },
+                "line_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Target line UUID on the order.",
+                },
+                "expected_version": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optimistic concurrency aggregate version.",
+                },
+                "quantity": {
+                    "type": ["integer", "string"],
+                    "description": "Updated positive integer or rational quantity string.",
+                },
+                "unit_price_minor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Updated selling unit price in minor units.",
+                },
+                "manual_discount_bps": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Updated manual line discount in basis points.",
+                },
+                "header_discount_bps": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "description": "Updated proportional header discount in basis points.",
+                },
+                "header_discount_minor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Updated fixed header discount in minor units.",
+                },
             },
+        },
+    },
+    {
+        "name": "export_orders_csv",
+        "title": "Export Orders CSV",
+        "description": (
+            "Export tenant orders as formula-injection-sanitized CSV with cost and margin "
+            "columns gated by 'valuation:cost:read' and 'orders:margin:read'. "
+            "Requires 'orders:export'."
+        ),
+        "annotations": {
+            "title": "Export Orders CSV",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {},
         },
     },
 )
@@ -134,11 +418,33 @@ def _parse_uuid_arg(raw: object, field_name: str) -> UUID:
         raise ValidationError(f"Field '{field_name}' is not a valid UUID.") from exc
 
 
+def _require_str_arg(args: Mapping[str, Any], field_name: str) -> str:
+    raw = args.get(field_name)
+    if not isinstance(raw, str):
+        raise ValidationError(f"Field '{field_name}' must be a string.")
+    return raw
+
+
 def _reject_client_tenant_override(args: Mapping[str, Any]) -> None:
     if "tenant_id" in args:
         raise AuthorizationError(
             "Client-supplied tenant_id is forbidden; tenant scope is bound server-side.",
             code="CLIENT_TENANT_OVERRIDE_FORBIDDEN",
+        )
+
+
+def _validate_allowed_keys(
+    args: Mapping[str, Any],
+    allowed_keys: frozenset[str],
+    context: str,
+) -> None:
+    _reject_client_tenant_override(args)
+    unknown = sorted(set(args.keys()) - allowed_keys)
+    if unknown:
+        raise ValidationError(
+            f"Unknown argument(s) for {context}: {', '.join(unknown)}.",
+            code="UNKNOWN_TOOL_ARGUMENTS",
+            details={"unknown_arguments": unknown},
         )
 
 
@@ -160,22 +466,46 @@ class McpToolServer:
         self,
         principal: PrincipalContext,
         rpc_request: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        """Handle an authenticated MCP JSON-RPC 2.0 request."""
+    ) -> dict[str, Any] | None:
+        """Handle an MCP JSON-RPC 2.0 request or notification (`None` for notifications)."""
+        is_notification = "id" not in rpc_request
         req_id = rpc_request.get("id")
         if rpc_request.get("jsonrpc") != "2.0":
             return self._rpc_error(req_id, -32600, "Invalid Request: jsonrpc must be '2.0'.")
 
         method = rpc_request.get("method")
+        if not isinstance(method, str) or not method:
+            return self._rpc_error(req_id, -32600, "Invalid Request: method string required.")
+
+        if is_notification or method.startswith("notifications/"):
+            return None
+
         if method == "initialize":
+            params = rpc_request.get("params")
+            requested_version = (
+                params.get("protocolVersion") if isinstance(params, Mapping) else None
+            )
+            negotiated_version = (
+                requested_version
+                if isinstance(requested_version, str)
+                and requested_version in SUPPORTED_MCP_PROTOCOL_VERSIONS
+                else DEFAULT_MCP_PROTOCOL_VERSION
+            )
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "ledger-guard-mcp", "version": "0.1.0"},
+                    "protocolVersion": negotiated_version,
+                    "serverInfo": {"name": "ledger-guard-mcp", "version": SERVER_VERSION},
                     "capabilities": {"tools": {"listChanged": False}},
                 },
+            }
+
+        if method == "ping":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {},
             }
 
         if method == "tools/list":
@@ -183,6 +513,20 @@ class McpToolServer:
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {"tools": list(MCP_TOOLS_SPEC)},
+            }
+
+        if method == "resources/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"resources": []},
+            }
+
+        if method == "prompts/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"prompts": []},
             }
 
         if method == "tools/call":
@@ -210,12 +554,31 @@ class McpToolServer:
             _reject_client_tenant_override(args)
 
             if tool_name == "get_order":
+                _validate_allowed_keys(args, _GET_ORDER_KEYS, "get_order")
                 order_id = _parse_uuid_arg(args.get("order_id"), "order_id")
                 result_payload = self._orders.get_order(principal, order_id=order_id)
                 return self._tool_success(req_id, result_payload, replayed=False)
 
+            if tool_name == "list_orders":
+                _validate_allowed_keys(args, _LIST_ORDERS_KEYS, "list_orders")
+                raw_limit = args.get("limit", 50)
+                limit = require_strict_int(raw_limit, "limit")
+                result_payload = self._orders.list_orders(principal, limit=limit)
+                return self._tool_success(req_id, result_payload, replayed=False)
+
+            if tool_name == "export_orders_csv":
+                _validate_allowed_keys(args, _EXPORT_ORDERS_CSV_KEYS, "export_orders_csv")
+                csv_text = self._orders.export_orders_csv(principal)
+                line_count = max(0, len(csv_text.splitlines()) - 1)
+                return self._tool_success(
+                    req_id,
+                    {"csv": csv_text, "row_count": line_count},
+                    replayed=False,
+                )
+
             if tool_name == "create_order":
-                idem_key = str(args.get("idempotency_key", ""))
+                _validate_allowed_keys(args, _CREATE_ORDER_KEYS, "create_order")
+                idem_key = _require_str_arg(args, "idempotency_key")
                 outcome = self._idempotency.execute(
                     tenant_id=principal.tenant_id,
                     principal_id=principal.principal_id,
@@ -227,7 +590,8 @@ class McpToolServer:
                 return self._tool_success(req_id, outcome.body, replayed=outcome.replayed)
 
             if tool_name == "confirm_order":
-                idem_key = str(args.get("idempotency_key", ""))
+                _validate_allowed_keys(args, _CONFIRM_ORDER_KEYS, "confirm_order")
+                idem_key = _require_str_arg(args, "idempotency_key")
                 order_id = _parse_uuid_arg(args.get("order_id"), "order_id")
                 exp_ver = require_strict_int(args.get("expected_version"), "expected_version")
                 outcome = self._idempotency.execute(
@@ -246,10 +610,11 @@ class McpToolServer:
                 return self._tool_success(req_id, outcome.body, replayed=outcome.replayed)
 
             if tool_name == "approve_margin":
-                idem_key = str(args.get("idempotency_key", ""))
+                _validate_allowed_keys(args, _APPROVE_MARGIN_KEYS, "approve_margin")
+                idem_key = _require_str_arg(args, "idempotency_key")
                 order_id = _parse_uuid_arg(args.get("order_id"), "order_id")
                 exp_ver = require_strict_int(args.get("expected_version"), "expected_version")
-                reason = str(args.get("reason", ""))
+                reason = _require_str_arg(args, "reason")
                 outcome = self._idempotency.execute(
                     tenant_id=principal.tenant_id,
                     principal_id=principal.principal_id,
@@ -269,7 +634,8 @@ class McpToolServer:
                 return self._tool_success(req_id, outcome.body, replayed=outcome.replayed)
 
             if tool_name == "amend_order_line":
-                idem_key = str(args.get("idempotency_key", ""))
+                _validate_allowed_keys(args, _AMEND_ORDER_LINE_KEYS, "amend_order_line")
+                idem_key = _require_str_arg(args, "idempotency_key")
                 order_id = _parse_uuid_arg(args.get("order_id"), "order_id")
                 line_id = _parse_uuid_arg(args.get("line_id"), "line_id")
                 exp_ver = require_strict_int(args.get("expected_version"), "expected_version")
@@ -314,9 +680,11 @@ class McpToolServer:
             raise ValidationError("MCP create_order requires a non-empty 'lines' array.")
 
         commands: list[OrderLineCommand] = []
-        for entry in raw_lines:
+        for idx, entry in enumerate(raw_lines):
             if not isinstance(entry, Mapping):
                 raise ValidationError("Each line entry must be an object.")
+            _validate_allowed_keys(entry, _CREATE_ORDER_LINE_KEYS, f"create_order.lines[{idx}]")
+            sku = _require_str_arg(entry, "sku")
             raw_qty = entry.get("quantity")
             if not isinstance(raw_qty, (int, str)) or isinstance(raw_qty, bool):
                 raise ValidationError("Line quantity must be integer or rational string.")
@@ -329,26 +697,32 @@ class McpToolServer:
             )
             commands.append(
                 OrderLineCommand(
-                    sku=str(entry.get("sku", "")),
+                    sku=sku,
                     quantity=raw_qty,
                     unit_price_minor=unit_price,
                     manual_discount_bps=disc_bps,
                 )
             )
 
+        raw_currency = _require_str_arg(args, "currency")
         try:
-            currency = Currency(str(args.get("currency", "")))
+            currency = Currency(raw_currency)
         except ValueError as exc:
             raise ValidationError("Unsupported currency code.") from exc
 
+        raw_order_kind = args.get("order_kind", "standard")
+        if not isinstance(raw_order_kind, str):
+            raise ValidationError("Field 'order_kind' must be a string.")
         try:
-            order_kind = OrderKind(str(args.get("order_kind", "standard")))
+            order_kind = OrderKind(raw_order_kind)
         except ValueError as exc:
             raise ValidationError("Unsupported order_kind classification.") from exc
 
+        customer_ref = _require_str_arg(args, "customer_ref")
+
         return self._orders.create_order(
             principal,
-            customer_ref=str(args.get("customer_ref", "")),
+            customer_ref=customer_ref,
             order_kind=order_kind,
             currency=currency,
             lines=commands,

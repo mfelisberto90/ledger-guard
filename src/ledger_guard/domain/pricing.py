@@ -15,6 +15,7 @@ from ledger_guard.domain.money import (
     parse_rational_quantity,
     require_strict_int,
     round_rational_half_even,
+    validate_safe_text,
 )
 
 
@@ -66,6 +67,8 @@ class CostSnapshot:
     valuation_revision: int
 
     def __post_init__(self) -> None:
+        cleaned_sku = validate_safe_text(self.sku, "sku", max_length=64)
+        object.__setattr__(self, "sku", cleaned_sku)
         cost = require_strict_int(self.base_unit_cost_minor, "base_unit_cost_minor")
         rev = require_strict_int(self.valuation_revision, "valuation_revision")
         if cost < 0:
@@ -100,10 +103,10 @@ class LinePricingInput:
     cost_snapshot: CostSnapshot | None = None
 
     def __post_init__(self) -> None:
-        if not self.sku.strip() or len(self.sku) > 64:
-            raise ValidationError("SKU must be between 1 and 64 characters.")
-        if not self.description.strip() or len(self.description) > 255:
-            raise ValidationError("Line description must be between 1 and 255 characters.")
+        cleaned_sku = validate_safe_text(self.sku, "sku", max_length=64)
+        cleaned_desc = validate_safe_text(self.description, "description", max_length=255)
+        object.__setattr__(self, "sku", cleaned_sku)
+        object.__setattr__(self, "description", cleaned_desc)
         parse_rational_quantity(self.quantity, "quantity")
         price = require_strict_int(self.unit_price_minor, "unit_price_minor")
         if price < 0:

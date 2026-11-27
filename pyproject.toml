@@ -1,7 +1,7 @@
 [project]
 name = "ledger-guard"
-version = "0.1.0"
-description = "Hexagonal Python 3.12 commercial order pricing, exact Fraction margin-approval engine & multi-tenant security reference (PostgreSQL 17 FORCE RLS, FastAPI, MCP tools)"
+version = "0.2.0"
+description = "Hexagonal Python 3.12 commercial order pricing, exact Fraction margin-approval engine & multi-tenant security reference (PostgreSQL 17 FORCE RLS, FastAPI, MCP stdio & HTTP tools)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -17,6 +17,7 @@ keywords = [
     "row-level-security",
     "fastapi",
     "mcp",
+    "model-context-protocol",
     "multi-tenant",
 ]
 dependencies = [
@@ -25,11 +26,25 @@ dependencies = [
     "uvicorn>=0.32.0,<1.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/mfelisberto90/ledger-guard"
+Repository = "https://github.com/mfelisberto90/ledger-guard"
+Issues = "https://github.com/mfelisberto90/ledger-guard/issues"
+Changelog = "https://github.com/mfelisberto90/ledger-guard/blob/main/CHANGELOG.md"
+Security = "https://github.com/mfelisberto90/ledger-guard/blob/main/SECURITY.md"
+
+[project.scripts]
+ledger-guard-mcp = "ledger_guard.mcp.stdio_cli:main"
+ledger-guard = "ledger_guard.mcp.stdio_cli:main"
+
 [dependency-groups]
 dev = [
     "httpx>=0.28.0,<1.0.0",
+    "httpx2>=2.0.0",
     "mypy>=1.13.0,<2.0.0",
-    "pytest>=8.3.0,<9.0.0",
+    "pip-audit>=2.7.0,<3.0.0",
+    "psycopg[binary]>=3.2.0,<4.0.0",
+    "pytest>=9.0.3,<10.0.0",
     "ruff>=0.8.0,<1.0.0",
 ]
 
@@ -43,6 +58,9 @@ packages = ["src/ledger_guard"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+filterwarnings = [
+    "error::DeprecationWarning",
+]
 
 [tool.mypy]
 python_version = "3.12"

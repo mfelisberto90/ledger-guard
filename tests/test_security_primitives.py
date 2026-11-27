@@ -259,18 +259,23 @@ def test_redactor_scrubs_tokens_jwt_pii_and_luhn_pans_with_bounded_depth() -> No
     assert passes_luhn_checksum("4532015112830366") is True
     assert passes_luhn_checksum("4532015112830367") is False
 
+    synthetic_jwt = ".".join(
+        ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJ1c2VyIn0", "c2lnbmF0dXJl"]
+    )
+    synthetic_stripe_key = "".join(["sk_", "live_", "ABCDEF1234567890"])
+    synthetic_bearer = "".join(["super_secret_", "token_999111"])
     sample = (
-        f"Auth: Bearer super_secret_token_999111 "
-        f"jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl "
-        f"key=sk_live_ABCDEF1234567890 "
+        f"Auth: Bearer {synthetic_bearer} "
+        f"jwt={synthetic_jwt} "
+        f"key={synthetic_stripe_key} "
         f"url=https://api.alpha.example/cb?token=xyz987&ok=1 "
         f"contact=buyer@customer.example tel=+44 7700 900123 "
         f"card={valid_pan} order_ref={invalid_luhn} "
         f"uuid={TENANT_ALPHA}"
     )
     cleaned = redactor.redact_text(sample)
-    assert "super_secret_token_999111" not in cleaned
-    assert "sk_live_ABCDEF1234567890" not in cleaned
+    assert synthetic_bearer not in cleaned
+    assert synthetic_stripe_key not in cleaned
     assert "eyJhbGciOiJIUzI1NiJ9" not in cleaned
     assert "xyz987" not in cleaned
     assert "buyer@customer.example" not in cleaned

@@ -20,7 +20,12 @@ from ledger_guard.domain.margin_gate import (
     project_order_for_principal,
     record_four_eyes_approval,
 )
-from ledger_guard.domain.money import Currency, parse_rational_quantity
+from ledger_guard.domain.money import (
+    Currency,
+    parse_rational_quantity,
+    require_strict_int,
+    validate_safe_text,
+)
 from ledger_guard.domain.pricing import (
     ItemKind,
     LinePricingInput,
@@ -92,7 +97,7 @@ class OrderService:
         pricing_inputs: list[LinePricingInput] = []
 
         for cmd in lines:
-            clean_sku = cmd.sku.strip()
+            clean_sku = validate_safe_text(cmd.sku, "sku", max_length=64)
             catalog_item = self._catalog.get_catalog_item(principal.tenant_id, clean_sku)
             if catalog_item is None:
                 raise NotFoundError(
@@ -192,6 +197,26 @@ class OrderService:
             raise NotFoundError("Order not found.", code="ORDER_NOT_FOUND")
         policy = self._policies.get_policy(principal.tenant_id)
         return project_order_for_principal(order, policy, principal)
+
+    def list_orders(
+        self,
+        principal: PrincipalContext,
+        *,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List bounded tenant orders projected to `principal`'s capabilities."""
+        principal.require_capability("orders:read")
+        strict_limit = require_strict_int(limit, "limit")
+        if strict_limit < 1 or strict_limit > 200:
+            raise ValidationError("Field 'limit' must be between 1 and 200.")
+        policy = self._policies.get_policy(principal.tenant_id)
+        orders = self._orders.list_orders(principal.tenant_id, limit=strict_limit)
+        items = [project_order_for_principal(order, policy, principal) for order in orders]
+        return {
+            "items": items,
+            "count": len(items),
+            "limit": strict_limit,
+        }
 
     def confirm_order(
         self,

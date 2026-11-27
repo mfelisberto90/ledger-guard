@@ -9,12 +9,14 @@ import json
 import secrets
 import threading
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from ledger_guard.domain.errors import AuthenticationError, AuthorizationError, ValidationError
 from ledger_guard.domain.margin_gate import PrincipalContext, normalize_principal_id
+from ledger_guard.domain.money import require_strict_int, validate_safe_text
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -81,12 +83,13 @@ class PasswordHasher:
 
 @dataclass(frozen=True, slots=True)
 class VerifiedTokenClaims:
-    """Server-verified bearer token claims."""
+    """Server-verified bearer token claims with optional delegated capability scope."""
 
     principal_id: str
     tenant_id: UUID
     issued_at: int
     expires_at: int
+    scoped_capabilities: frozenset[str] | None = None
 
 
 class TokenService:
@@ -105,15 +108,36 @@ class TokenService:
         tenant_id: UUID,
         now_epoch: int | None = None,
         ttl_seconds: int | None = None,
+        scoped_capabilities: Collection[str] | None = None,
     ) -> str:
-        now = int(time.time()) if now_epoch is None else now_epoch
-        ttl = self._default_ttl if ttl_seconds is None else ttl_seconds
-        payload = {
+        now = int(time.time()) if now_epoch is None else require_strict_int(now_epoch, "now_epoch")
+        ttl = (
+            self._default_ttl
+            if ttl_seconds is None
+            else require_strict_int(ttl_seconds, "ttl_seconds")
+        )
+        if ttl <= 0:
+            raise ValidationError("Token ttl_seconds must be positive.")
+
+        payload: dict[str, Any] = {
             "sub": normalize_principal_id(principal_id),
             "tid": str(tenant_id),
             "iat": now,
             "exp": now + ttl,
         }
+        if scoped_capabilities is not None:
+            normalized_scp = sorted(
+                {
+                    validate_safe_text(cap, "scoped_capability", max_length=64)
+                    for cap in scoped_capabilities
+                }
+            )
+            if not normalized_scp:
+                raise ValidationError(
+                    "Delegated token scoped_capabilities must contain at least one capability."
+                )
+            payload["scp"] = normalized_scp
+
         payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         encoded_payload = _b64url_encode(payload_bytes)
         sig = hmac.new(self._key, encoded_payload.encode("ascii"), hashlib.sha256).digest()
@@ -139,7 +163,18 @@ class TokenService:
             tid = UUID(str(raw_obj["tid"]))
             iat = int(raw_obj["iat"])
             exp = int(raw_obj["exp"])
-        except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            parsed_scp: frozenset[str] | None = None
+            if "scp" in raw_obj:
+                raw_scp = raw_obj["scp"]
+                if not isinstance(raw_scp, list) or not raw_scp:
+                    raise ValueError("Invalid scp claim list.")
+                validated_items: set[str] = set()
+                for item in raw_scp:
+                    if not isinstance(item, str):
+                        raise ValueError("Non-string capability in scp claim.")
+                    validated_items.add(validate_safe_text(item, "scp", max_length=64))
+                parsed_scp = frozenset(validated_items)
+        except (KeyError, ValueError, TypeError, ValidationError, json.JSONDecodeError) as exc:
             raise AuthenticationError("Invalid bearer token claims payload.") from exc
 
         now = int(time.time()) if now_epoch is None else now_epoch
@@ -151,6 +186,7 @@ class TokenService:
             tenant_id=tid,
             issued_at=iat,
             expires_at=exp,
+            scoped_capabilities=parsed_scp,
         )
 
 
@@ -191,6 +227,25 @@ class MembershipDirectory:
                 code="INACTIVE_OR_MISSING_MEMBERSHIP",
             )
         return record.principal
+
+    def resolve_scoped_principal(
+        self,
+        tenant_id: UUID,
+        principal_id: str,
+        scoped_capabilities: frozenset[str] | None = None,
+    ) -> PrincipalContext:
+        """Intersect active membership capabilities with delegated token scopes fail-closed."""
+        member = self.resolve_active_principal(tenant_id, principal_id)
+        if scoped_capabilities is None:
+            return member
+        effective_capabilities = member.capabilities & scoped_capabilities
+        return PrincipalContext(
+            principal_id=member.principal_id,
+            tenant_id=member.tenant_id,
+            role=member.role,
+            capabilities=effective_capabilities,
+            is_active=member.is_active,
+        )
 
     def get_credential_record(
         self,

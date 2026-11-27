@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
@@ -24,11 +24,12 @@ from ledger_guard.adapters.in_memory import (
 from ledger_guard.application.order_service import OrderLineCommand, OrderService
 from ledger_guard.domain.errors import (
     AuthenticationError,
+    AuthorizationError,
     DomainError,
     RateLimitExceededError,
 )
 from ledger_guard.domain.margin_gate import OrderKind, PrincipalContext
-from ledger_guard.domain.money import Currency
+from ledger_guard.domain.money import Currency, validate_safe_text
 from ledger_guard.mcp.server import McpToolServer
 from ledger_guard.ports import AuditEvent
 from ledger_guard.security.auth import MembershipDirectory, PasswordHasher, TokenService
@@ -99,6 +100,13 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+class DelegateTokenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capabilities: list[str] = Field(min_length=1, max_length=32)
+    ttl_seconds: StrictInt = Field(default=900, ge=60, le=3_600)
+
+
 class CreateOrderLinePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -161,7 +169,7 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
 
     app = FastAPI(
         title="LedgerGuard API",
-        version="0.1.0",
+        version="0.2.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -230,8 +238,10 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
             raise AuthenticationError("Authorization header must use Bearer scheme.")
 
         claims = deps.tokens.verify_token(parts[1])
-        principal = deps.memberships.resolve_active_principal(
-            claims.tenant_id, claims.principal_id
+        principal = deps.memberships.resolve_scoped_principal(
+            claims.tenant_id,
+            claims.principal_id,
+            claims.scoped_capabilities,
         )
         deps.rate_limiter.check_request(
             client_ip=_client_ip_from_request(request),
@@ -278,6 +288,54 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
             "token_type": "bearer",
             "tenant_id": str(record.principal.tenant_id),
         }
+
+    @app.post("/v1/auth/delegate-token")
+    async def delegate_token_endpoint(
+        payload: DelegateTokenRequest,
+        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+    ) -> dict[str, Any]:
+        requested = {
+            validate_safe_text(cap, "capability", max_length=64) for cap in payload.capabilities
+        }
+        disallowed = sorted(requested - principal.capabilities)
+        if disallowed:
+            raise AuthorizationError(
+                "Cannot delegate capabilities not held by the authenticated principal.",
+                code="DELEGATION_SCOPE_ESCALATION",
+                details={"disallowed_capabilities": disallowed},
+            )
+        delegated_token = deps.tokens.issue_token(
+            principal_id=principal.principal_id,
+            tenant_id=principal.tenant_id,
+            ttl_seconds=payload.ttl_seconds,
+            scoped_capabilities=requested,
+        )
+        sorted_caps = sorted(requested)
+        deps.outbox.append_event(
+            AuditEvent(
+                event_id=uuid4(),
+                tenant_id=principal.tenant_id,
+                aggregate_id=uuid4(),
+                actor_principal_id=principal.principal_id,
+                event_type="auth.token_delegated",
+                created_at_utc=datetime.now(UTC).isoformat(),
+                metadata={"scoped_capabilities": sorted_caps, "ttl_seconds": payload.ttl_seconds},
+            )
+        )
+        return {
+            "access_token": delegated_token,
+            "token_type": "bearer",
+            "tenant_id": str(principal.tenant_id),
+            "scoped_capabilities": sorted_caps,
+            "expires_in": payload.ttl_seconds,
+        }
+
+    @app.get("/v1/orders")
+    async def list_orders_endpoint(
+        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> dict[str, Any]:
+        return deps.order_service.list_orders(principal, limit=limit)
 
     @app.post("/v1/orders")
     async def create_order_endpoint(
@@ -478,11 +536,14 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
         )
         return {"status": "processed", "event_id": claim.event_id}
 
-    @app.post("/mcp")
+    @app.post("/mcp", response_model=None)
     async def mcp_jsonrpc_endpoint(
         rpc_body: dict[str, Any],
         principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
-    ) -> dict[str, Any]:
-        return deps.mcp_server.handle_jsonrpc(principal, rpc_body)
+    ) -> Response | dict[str, Any]:
+        rpc_response = deps.mcp_server.handle_jsonrpc(principal, rpc_body)
+        if rpc_response is None:
+            return Response(status_code=202)
+        return rpc_response
 
     return app

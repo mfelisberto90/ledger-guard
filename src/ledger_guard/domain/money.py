@@ -13,6 +13,42 @@ from fractions import Fraction
 
 from ledger_guard.domain.errors import CurrencyMismatchError, ValidationError
 
+_BIDI_AND_INVISIBLE_CODEPOINTS: frozenset[int] = frozenset(
+    {
+        0x061C,  # ARABIC LETTER MARK
+        0x200E,  # LEFT-TO-RIGHT MARK
+        0x200F,  # RIGHT-TO-LEFT MARK
+        0x202A,  # LEFT-TO-RIGHT EMBEDDING
+        0x202B,  # RIGHT-TO-LEFT EMBEDDING
+        0x202C,  # POP DIRECTIONAL FORMATTING
+        0x202D,  # LEFT-TO-RIGHT OVERRIDE
+        0x202E,  # RIGHT-TO-LEFT OVERRIDE
+        0x2066,  # LEFT-TO-RIGHT ISOLATE
+        0x2067,  # RIGHT-TO-LEFT ISOLATE
+        0x2068,  # FIRST STRONG ISOLATE
+        0x2069,  # POP DIRECTIONAL ISOLATE
+    }
+)
+
+
+def validate_safe_text(value: str, field_name: str, *, max_length: int) -> str:
+    """Validate bounded non-empty text, rejecting ASCII control and Unicode Bidi characters."""
+    if not isinstance(value, str):
+        raise ValidationError(f"Field '{field_name}' must be a string.")
+    for ch in value:
+        codepoint = ord(ch)
+        if codepoint < 0x20 or codepoint == 0x7F or codepoint in _BIDI_AND_INVISIBLE_CODEPOINTS:
+            raise ValidationError(
+                f"Field '{field_name}' contains prohibited control or bidirectional characters.",
+                code="UNSAFE_CONTROL_OR_BIDI_CHAR",
+            )
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > max_length:
+        raise ValidationError(
+            f"Field '{field_name}' must be between 1 and {max_length} characters."
+        )
+    return cleaned
+
 
 class Currency(StrEnum):
     """Supported ISO 4217 currencies with minor-unit precision."""
