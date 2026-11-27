@@ -74,6 +74,7 @@ def build_csp_header(nonce: str) -> str:
         f"default-src 'self'; "
         f"script-src 'self' 'nonce-{nonce}'; "
         f"style-src 'self' 'nonce-{nonce}'; "
+        f"style-src-attr 'none'; "
         f"img-src 'self' data:; "
         f"media-src 'self' data: blob:; "
         f"font-src 'self' data:; "
@@ -233,7 +234,11 @@ class SecurityDefenseMiddleware:
             return False
         try:
             claims = self._token_service.verify_token(parts[1])
-            self._memberships.resolve_active_principal(claims.tenant_id, claims.principal_id)
+            self._memberships.resolve_scoped_principal(
+                claims.tenant_id,
+                claims.principal_id,
+                claims.scoped_capabilities,
+            )
             return True
         except (AuthenticationError, AuthorizationError):
             return False

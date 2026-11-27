@@ -457,9 +457,11 @@ def test_mcp_server_tools_list_and_full_domain_rbac_parity(world: SeededWorld) -
     assert tool_names == {
         "create_order",
         "get_order",
+        "list_orders",
         "confirm_order",
         "approve_margin",
         "amend_order_line",
+        "export_orders_csv",
     }
 
     # 2. Prompt-injected tenant_id override inside MCP tool arguments is blocked!

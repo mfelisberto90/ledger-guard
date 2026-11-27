@@ -11,9 +11,23 @@ permissions:
 
 jobs:
   quality-and-security:
-    name: Python 3.12 Lint, Strict Typing, Security Invariants & Pytest
+    name: Python 3.12, Security Lint, MCP stdio & PostgreSQL 17 FORCE RLS
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_ci_ephemeral
+          POSTGRES_DB: ledgerguard_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ledgerguard_test"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,8 +47,24 @@ jobs:
       - name: Mypy strict static typing
         run: uv run mypy --strict src
 
-      - name: Architectural & security invariant linter
-        run: uv run python3 scripts/security-lint.py
+      - name: Architectural & SQL RLS invariant linter (self-test + SARIF)
+        run: |
+          uv run python3 scripts/security-lint.py --self-test
+          uv run python3 scripts/security-lint.py --sarif results.sarif
 
-      - name: Pytest suite
+      - name: Dependency CVE audit (pip-audit)
+        run: uv run pip-audit
+
+      - name: Native MCP stdio server handshake check
+        run: |
+          printf '%s\n%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | uv run ledger-guard-mcp \
+            | python3 -c 'import json, sys; lines = [json.loads(l) for l in sys.stdin if l.strip()]; assert len(lines) == 2 and len(lines[1]["result"]["tools"]) == 7, lines'
+
+      - name: Pytest suite (unit, contract parity & live PostgreSQL 17 FORCE RLS)
+        env:
+          LEDGER_GUARD_TEST_PG_DSN: postgresql://postgres:postgres_ci_ephemeral@127.0.0.1:5432/ledgerguard_test
         run: uv run pytest -v

@@ -13,7 +13,7 @@ from ledger_guard.domain.errors import (
     SeparationOfDutiesError,
     ValidationError,
 )
-from ledger_guard.domain.money import Currency, require_strict_int
+from ledger_guard.domain.money import Currency, require_strict_int, validate_safe_text
 from ledger_guard.domain.pricing import (
     ConditionStepKind,
     PricedOrderLine,
@@ -53,10 +53,8 @@ class OrderStatus(StrEnum):
 
 def normalize_principal_id(raw_principal_id: str) -> str:
     """Canonicalize principal identifiers so case/whitespace tricks never bypass four-eyes."""
-    normalized = raw_principal_id.strip().lower()
-    if not normalized or len(normalized) > 128:
-        raise ValidationError("Principal identifier must be between 1 and 128 characters.")
-    return normalized
+    cleaned = validate_safe_text(raw_principal_id, "principal_id", max_length=128)
+    return cleaned.lower()
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +131,8 @@ class ApprovalRecord:
                 "Margin approval requires a non-empty reason (1..1000 characters).",
                 code="APPROVAL_REASON_REQUIRED",
             )
-        object.__setattr__(self, "reason", cleaned_reason)
+        validated_reason = validate_safe_text(self.reason, "reason", max_length=1_000)
+        object.__setattr__(self, "reason", validated_reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,8 +176,8 @@ class SalesOrder:
     def __post_init__(self) -> None:
         object.__setattr__(self, "created_by", normalize_principal_id(self.created_by))
         object.__setattr__(self, "last_amended_by", normalize_principal_id(self.last_amended_by))
-        if not self.customer_ref.strip() or len(self.customer_ref) > 128:
-            raise ValidationError("customer_ref must be between 1 and 128 characters.")
+        cleaned_ref = validate_safe_text(self.customer_ref, "customer_ref", max_length=128)
+        object.__setattr__(self, "customer_ref", cleaned_ref)
         if self.version < 1 or self.pricing_version < 1:
             raise ValidationError("Order version and pricing_version must be >= 1.")
 

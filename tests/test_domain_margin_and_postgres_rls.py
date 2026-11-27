@@ -329,6 +329,11 @@ class _FakeSqlCursor:
             return (1,)
         return None
 
+    def fetchall(self) -> Sequence[tuple[Any, ...]]:
+        if self.membership_exists:
+            return [(1,)]
+        return []
+
     def close(self) -> None:
         self.closed = True
 
