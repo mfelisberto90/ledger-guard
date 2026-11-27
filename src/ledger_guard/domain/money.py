@@ -1,4 +1,4 @@
-"""Exact integer minor-unit money and rational unit-of-measure (UoM) conversions.
+"""Exact integer minor-unit money, bounded inputs, and rational unit-of-measure (UoM).
 
 Zero I/O, zero imprecise binary representations: every intermediate calculation runs in
 `fractions.Fraction` and settles to integer minor units (`pence` / `cents`) via exact
@@ -7,11 +7,18 @@ Euclidean `ROUND_HALF_EVEN` (banker's rounding).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from fractions import Fraction
 
-from ledger_guard.domain.errors import CurrencyMismatchError, ValidationError
+from ledger_guard.domain.errors import ValidationError
+
+MAX_MINOR_AMOUNT: int = 10_000_000_000_000  # £100B per unit/surcharge; SQL BIGINT & IEEE safe
+MAX_ORDER_TOTAL_MINOR: int = 9_000_000_000_000_000  # Below JS MAX_SAFE_INTEGER (9.007e15) & BIGINT
+MAX_LINE_QUANTITY: int = 1_000_000_000
+MAX_QUANTITY_DENOMINATOR: int = 1_000_000
+MAX_INT32: int = 2_147_483_647
 
 _BIDI_AND_INVISIBLE_CODEPOINTS: frozenset[int] = frozenset(
     {
@@ -30,14 +37,21 @@ _BIDI_AND_INVISIBLE_CODEPOINTS: frozenset[int] = frozenset(
     }
 )
 
+_STRICT_RATIONAL_RE = re.compile(r"\A([0-9]{1,10})(?:/([1-9][0-9]{0,6}))?\Z")
+
 
 def validate_safe_text(value: str, field_name: str, *, max_length: int) -> str:
-    """Validate bounded non-empty text, rejecting ASCII control and Unicode Bidi characters."""
+    """Validate bounded text, rejecting ASCII control, Unicode Bidi, and surrogate characters."""
     if not isinstance(value, str):
         raise ValidationError(f"Field '{field_name}' must be a string.")
     for ch in value:
         codepoint = ord(ch)
-        if codepoint < 0x20 or codepoint == 0x7F or codepoint in _BIDI_AND_INVISIBLE_CODEPOINTS:
+        if (
+            codepoint < 0x20
+            or codepoint == 0x7F
+            or (0xD800 <= codepoint <= 0xDFFF)
+            or codepoint in _BIDI_AND_INVISIBLE_CODEPOINTS
+        ):
             raise ValidationError(
                 f"Field '{field_name}' contains prohibited control or bidirectional characters.",
                 code="UNSAFE_CONTROL_OR_BIDI_CHAR",
@@ -51,19 +65,13 @@ def validate_safe_text(value: str, field_name: str, *, max_length: int) -> str:
 
 
 class Currency(StrEnum):
-    """Supported ISO 4217 currencies with minor-unit precision."""
+    """Supported ISO 4217 currencies."""
 
     GBP = "GBP"
     EUR = "EUR"
     USD = "USD"
     BRL = "BRL"
     JPY = "JPY"
-
-    @property
-    def minor_exponent(self) -> int:
-        if self is Currency.JPY:
-            return 0
-        return 2
 
 
 def require_strict_int(value: object, field_name: str) -> int:
@@ -76,24 +84,42 @@ def require_strict_int(value: object, field_name: str) -> int:
     return value
 
 
+def require_bounded_minor_int(
+    value: object,
+    field_name: str,
+    *,
+    min_value: int = 0,
+    max_value: int = MAX_MINOR_AMOUNT,
+) -> int:
+    """Validate strict integer inside `[min_value, max_value]` (prevents BIGINT/JSON overflow)."""
+    parsed = require_strict_int(value, field_name)
+    if parsed < min_value or parsed > max_value:
+        raise ValidationError(
+            f"Field '{field_name}' must be between {min_value} and {max_value}.",
+            code="AMOUNT_OUT_OF_BOUNDS",
+        )
+    return parsed
+
+
 def parse_rational_quantity(value: Fraction | int | str, field_name: str = "quantity") -> Fraction:
-    """Parse an exact positive rational quantity without binary floating-point conversion."""
+    """Parse an exact positive rational quantity without float or scientific-notation DoS."""
     if isinstance(value, bool):
         raise ValidationError(f"Field '{field_name}' cannot be a boolean.")
     if isinstance(value, Fraction):
+        require_strict_int(value.numerator, f"{field_name}.numerator")
+        require_strict_int(value.denominator, f"{field_name}.denominator")
         rational = value
     elif isinstance(value, int):
         rational = Fraction(value, 1)
     elif isinstance(value, str):
-        cleaned = value.strip()
-        if not cleaned or len(cleaned) > 64:
-            raise ValidationError(f"Field '{field_name}' must be a bounded non-empty rational.")
-        try:
-            rational = Fraction(cleaned)
-        except (ValueError, ZeroDivisionError) as exc:
+        cleaned = validate_safe_text(value, field_name, max_length=32)
+        match = _STRICT_RATIONAL_RE.fullmatch(cleaned)
+        if match is None:
             raise ValidationError(
-                f"Field '{field_name}' is not a valid rational quantity."
-            ) from exc
+                f"Field '{field_name}' must be a positive ASCII integer or 'num/den' rational."
+            )
+        num_s, den_s = match.group(1), match.group(2)
+        rational = Fraction(int(num_s), int(den_s) if den_s is not None else 1)
     else:
         raise ValidationError(
             f"Field '{field_name}' must be int, Fraction, or rational string."
@@ -101,6 +127,14 @@ def parse_rational_quantity(value: Fraction | int | str, field_name: str = "quan
 
     if rational <= 0:
         raise ValidationError(f"Field '{field_name}' must be strictly greater than zero.")
+    if rational.denominator > MAX_QUANTITY_DENOMINATOR:
+        raise ValidationError(
+            f"Field '{field_name}' denominator exceeds max {MAX_QUANTITY_DENOMINATOR}."
+        )
+    if rational > MAX_LINE_QUANTITY:
+        raise ValidationError(
+            f"Field '{field_name}' exceeds max line quantity {MAX_LINE_QUANTITY}."
+        )
     return rational
 
 
@@ -121,38 +155,6 @@ def round_rational_half_even(value: Fraction) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class MinorAmount:
-    """Immutable monetary value in integer minor units (`pence`, `cents`, `yen`)."""
-
-    amount_minor: int
-    currency: Currency
-
-    def __post_init__(self) -> None:
-        require_strict_int(self.amount_minor, "amount_minor")
-        if not isinstance(self.currency, Currency):
-            raise ValidationError("Invalid currency enum instance.")
-
-    def _assert_same_currency(self, other: MinorAmount) -> None:
-        if self.currency != other.currency:
-            raise CurrencyMismatchError(
-                f"Cannot combine {self.currency.value} and {other.currency.value} without "
-                "an explicit treasury FX rate snapshot."
-            )
-
-    def __add__(self, other: MinorAmount) -> MinorAmount:
-        self._assert_same_currency(other)
-        return MinorAmount(self.amount_minor + other.amount_minor, self.currency)
-
-    def __sub__(self, other: MinorAmount) -> MinorAmount:
-        self._assert_same_currency(other)
-        return MinorAmount(self.amount_minor - other.amount_minor, self.currency)
-
-    @classmethod
-    def zero(cls, currency: Currency) -> MinorAmount:
-        return cls(0, currency)
-
-
-@dataclass(frozen=True, slots=True)
 class UnitRatio:
     """Exact rational conversion between selling unit of measure and base stock unit.
 
@@ -166,23 +168,24 @@ class UnitRatio:
     denominator: int = 1
 
     def __post_init__(self) -> None:
-        num = require_strict_int(self.numerator, "unit_ratio.numerator")
-        den = require_strict_int(self.denominator, "unit_ratio.denominator")
-        if num <= 0 or den <= 0:
-            raise ValidationError("UnitRatio numerator and denominator must be positive integers.")
+        require_bounded_minor_int(
+            self.numerator,
+            "unit_ratio.numerator",
+            min_value=1,
+            max_value=MAX_LINE_QUANTITY,
+        )
+        require_bounded_minor_int(
+            self.denominator,
+            "unit_ratio.denominator",
+            min_value=1,
+            max_value=MAX_QUANTITY_DENOMINATOR,
+        )
 
     @property
     def as_fraction(self) -> Fraction:
         return Fraction(self.numerator, self.denominator)
 
-    def to_base_quantity(self, selling_quantity: Fraction | int) -> Fraction:
-        """Convert selling line quantity to exact base stock units without premature rounding."""
-        qty = parse_rational_quantity(selling_quantity, "selling_quantity")
-        return qty * self.as_fraction
-
     def exact_selling_unit_cost(self, base_unit_cost_minor: int) -> Fraction:
         """Compute exact rational selling-unit cost in minor units from base stock cost."""
-        cost = require_strict_int(base_unit_cost_minor, "base_unit_cost_minor")
-        if cost < 0:
-            raise ValidationError("Base unit cost cannot be negative.")
+        cost = require_bounded_minor_int(base_unit_cost_minor, "base_unit_cost_minor")
         return Fraction(cost, 1) * self.as_fraction

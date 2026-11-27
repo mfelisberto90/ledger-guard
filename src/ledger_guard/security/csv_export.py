@@ -12,19 +12,22 @@ _DANGEROUS_FORMULA_PREFIXES: frozenset[str] = frozenset(
         "+",
         "-",
         "@",
+        "|",
         "\t",
         "\r",
         "\n",
+        "\u2212",  # U+2212 Unicode minus sign
         "\uff1d",  # U+FF1D full-width equals sign
         "\uff0b",  # U+FF0B full-width plus sign
         "\uff0d",  # U+FF0D full-width hyphen-minus
         "\uff20",  # U+FF20 full-width commercial at
+        "\uff5c",  # U+FF5C full-width vertical line
     }
 )
 
 
 def sanitize_csv_cell(value: object) -> str:
-    """Neutralize spreadsheet formula triggers, including after leading whitespace."""
+    """Neutralize spreadsheet formula triggers, pipe DDE, and embedded newline prefixes."""
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -35,6 +38,17 @@ def sanitize_csv_cell(value: object) -> str:
     text = str(value)
     if not text:
         return ""
+
+    if "\r" in text or "\n" in text:
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        sanitized_lines: list[str] = []
+        for idx, line in enumerate(lines):
+            stripped_line = line.lstrip()
+            if idx > 0 and stripped_line and stripped_line[0] in _DANGEROUS_FORMULA_PREFIXES:
+                sanitized_lines.append(f"'{line}")
+            else:
+                sanitized_lines.append(line)
+        text = " ".join(sanitized_lines)
 
     if text[0] in _DANGEROUS_FORMULA_PREFIXES:
         return f"'{text}"

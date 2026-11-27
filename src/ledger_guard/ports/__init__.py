@@ -36,7 +36,6 @@ class ValuationContext:
 class IdempotencyRecord:
     """Persisted idempotency state scoped to `(tenant_id, principal_id, action, key)`."""
 
-    scope_key: str
     payload_sha256: str
     state: Literal["in_flight", "completed"]
     status_code: int | None = None
@@ -127,18 +126,16 @@ class WebhookDedupPort(Protocol):
         received_at_epoch: int,
     ) -> bool: ...
 
-
-class AuditOutboxPort(Protocol):
-    """Transactional audit trail outbox port."""
-
-    def append_event(self, event: AuditEvent) -> None: ...
-
-    def list_events(self, tenant_id: UUID) -> list[AuditEvent]: ...
+    def release_event(
+        self,
+        provider: str,
+        event_id: str,
+        tenant_id: UUID,
+    ) -> None: ...
 
 
 __all__ = [
     "AuditEvent",
-    "AuditOutboxPort",
     "CatalogItem",
     "CatalogPricingPort",
     "IdempotencyPort",

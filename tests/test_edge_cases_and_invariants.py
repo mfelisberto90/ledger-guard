@@ -293,7 +293,14 @@ def test_webhook_rejects_future_timestamp_skew_and_missing_headers() -> None:
         )
 
     future_ts = "1700001000"
-    sig = compute_webhook_signature(secret, future_ts, raw)
+    sig = compute_webhook_signature(
+        secret,
+        future_ts,
+        raw,
+        provider="stripe",
+        tenant_id=TENANT_ALPHA,
+        event_id="evt_future",
+    )
     with pytest.raises(WebhookVerificationError):
         verify_and_claim_webhook(
             provider="stripe",
@@ -353,51 +360,25 @@ def test_mcp_jsonrpc_protocol_error_codes_for_invalid_envelope_and_unknown_metho
 
 
 def test_mcp_idempotency_replay_and_payload_mismatch_conflict(world: SeededWorld) -> None:
-    headers = {"Authorization": f"Bearer {world.sales_rep_token}"}
     args = {
         "idempotency_key": "mcp-idem-0099",
         "customer_ref": "MCP-IDEM-REF",
         "currency": "GBP",
         "lines": [{"sku": "INSTALL-SVC", "quantity": 1}],
     }
-    r1 = world.client.post(
-        "/mcp",
-        headers=headers,
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "create_order", "arguments": args},
-        },
-    ).json()["result"]
+    r1 = world.mcp_call(world.sales_rep_token, "create_order", args, req_id=1)
     assert r1["structuredContent"]["idempotent_replay"] is False
 
-    r2 = world.client.post(
-        "/mcp",
-        headers=headers,
-        json={
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "create_order", "arguments": args},
-        },
-    ).json()["result"]
+    r2 = world.mcp_call(world.sales_rep_token, "create_order", args, req_id=2)
     assert r2["structuredContent"]["idempotent_replay"] is True
     assert r2["structuredContent"]["order_id"] == r1["structuredContent"]["order_id"]
 
-    tampered = world.client.post(
-        "/mcp",
-        headers=headers,
-        json={
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "create_order",
-                "arguments": {**args, "customer_ref": "MCP-TAMPERED"},
-            },
-        },
-    ).json()["result"]
+    tampered = world.mcp_call(
+        world.sales_rep_token,
+        "create_order",
+        {**args, "customer_ref": "MCP-TAMPERED"},
+        req_id=3,
+    )
     assert tampered["isError"] is True
     assert tampered["structuredContent"]["error"]["http_status"] == 409
 
@@ -411,44 +392,29 @@ def test_mcp_unauthenticated_request_rejected_with_http_401(world: SeededWorld) 
 
 
 def test_mcp_four_eyes_separation_of_duties_blocks_self_approval(world: SeededWorld) -> None:
-    headers = {"Authorization": f"Bearer {world.approver_token}"}
-    created = world.client.post(
-        "/mcp",
-        headers=headers,
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "create_order",
-                "arguments": {
-                    "idempotency_key": "mcp-sod-create-01",
-                    "customer_ref": "MCP-SOD-REF",
-                    "currency": "GBP",
-                    "lines": [{"sku": "VALVE-DN50", "quantity": 1, "unit_price_minor": 7_500}],
-                },
-            },
+    created = world.mcp_call(
+        world.approver_token,
+        "create_order",
+        {
+            "idempotency_key": "mcp-sod-create-01",
+            "customer_ref": "MCP-SOD-REF",
+            "currency": "GBP",
+            "lines": [{"sku": "VALVE-DN50", "quantity": 1, "unit_price_minor": 7_500}],
         },
-    ).json()["result"]["structuredContent"]
+        req_id=1,
+    )["structuredContent"]
 
-    self_approve = world.client.post(
-        "/mcp",
-        headers=headers,
-        json={
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "approve_margin",
-                "arguments": {
-                    "idempotency_key": "mcp-sod-approve-01",
-                    "order_id": created["order_id"],
-                    "expected_version": 1,
-                    "reason": "Attempting self approval via MCP tool",
-                },
-            },
+    self_approve = world.mcp_call(
+        world.approver_token,
+        "approve_margin",
+        {
+            "idempotency_key": "testkey-sod-1111",
+            "order_id": created["order_id"],
+            "expected_version": 1,
+            "reason": "Attempting self approval via MCP tool",
         },
-    ).json()["result"]
+        req_id=2,
+    )
     assert self_approve["isError"] is True
     assert (
         self_approve["structuredContent"]["error"]["code"] == "SEPARATION_OF_DUTIES_VIOLATION"

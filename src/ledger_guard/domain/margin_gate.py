@@ -9,11 +9,18 @@ from uuid import UUID
 
 from ledger_guard.domain.errors import (
     AuthorizationError,
+    ConflictError,
     MarginBlockedError,
     SeparationOfDutiesError,
     ValidationError,
 )
-from ledger_guard.domain.money import Currency, require_strict_int, validate_safe_text
+from ledger_guard.domain.money import (
+    MAX_INT32,
+    Currency,
+    require_bounded_minor_int,
+    require_strict_int,
+    validate_safe_text,
+)
 from ledger_guard.domain.pricing import (
     ConditionStepKind,
     PricedOrderLine,
@@ -172,14 +179,19 @@ class SalesOrder:
     created_at_utc: str
     updated_at_utc: str
     approvals: tuple[ApprovalRecord, ...] = ()
+    amended_by_history: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "created_by", normalize_principal_id(self.created_by))
         object.__setattr__(self, "last_amended_by", normalize_principal_id(self.last_amended_by))
+        normalized_history = frozenset(normalize_principal_id(p) for p in self.amended_by_history)
+        object.__setattr__(self, "amended_by_history", normalized_history)
         cleaned_ref = validate_safe_text(self.customer_ref, "customer_ref", max_length=128)
         object.__setattr__(self, "customer_ref", cleaned_ref)
-        if self.version < 1 or self.pricing_version < 1:
-            raise ValidationError("Order version and pricing_version must be >= 1.")
+        require_bounded_minor_int(self.version, "version", min_value=1, max_value=MAX_INT32)
+        require_bounded_minor_int(
+            self.pricing_version, "pricing_version", min_value=1, max_value=MAX_INT32
+        )
 
     @property
     def currency(self) -> Currency:
@@ -187,19 +199,18 @@ class SalesOrder:
 
     @property
     def active_approval(self) -> ApprovalRecord | None:
-        """Return an approval covering the current `pricing_version`, if present."""
+        """Return an approval covering the current `pricing_version` and exposure ceiling."""
         for record in reversed(self.approvals):
-            if record.approved_pricing_version == self.pricing_version:
+            if (
+                record.approved_pricing_version == self.pricing_version
+                and self.waterfall.net_goods_total_minor <= record.approved_net_goods_minor
+            ):
                 return record
         return None
 
 
 def is_margin_floor_satisfied(waterfall: PricedOrderWaterfall, minimum_margin_bps: int) -> bool:
-    """Exact integer cross-multiplication check (`margin / net_goods >= min_bps / 10_000`).
-
-    Avoids binary floating-point rounding and prevents borderline sub-floor margins
-    (e.g. `19.996%` against a `20.00%` floor) from slipping past early rounding.
-    """
+    """Exact integer cross-multiplication check (`margin / net_goods >= min_bps / 10_000`)."""
     net_goods = waterfall.net_goods_total_minor
     if net_goods > 0:
         return waterfall.margin_minor * 10_000 >= minimum_margin_bps * net_goods
@@ -286,15 +297,27 @@ def record_four_eyes_approval(
     approved_at_utc: str,
     approval_id: UUID,
 ) -> SalesOrder:
-    """Append an `ApprovalRecord` enforcing `orders:margin:approve` and four-eyes separation."""
+    """Append an `ApprovalRecord` enforcing `orders:margin:approve` and full four-eyes SoD."""
     approver.require_capability("orders:margin:approve")
     if approver.tenant_id != order.tenant_id:
         raise AuthorizationError("Cross-tenant approval attempt rejected.")
 
-    if approver.principal_id in {order.created_by, order.last_amended_by}:
+    if order.status is OrderStatus.CONFIRMED:
+        raise ConflictError(
+            "Confirmed order does not require margin approval.",
+            code="ORDER_ALREADY_CONFIRMED",
+        )
+    if order.active_approval is not None:
+        raise ConflictError(
+            "Current pricing_version already holds an active margin approval.",
+            code="MARGIN_ALREADY_APPROVED",
+        )
+
+    restricted_principals = {order.created_by, order.last_amended_by} | order.amended_by_history
+    if approver.principal_id in restricted_principals:
         raise SeparationOfDutiesError(
             "Four-eyes separation of duties violation: approver must be distinct from "
-            "both order creator and last amending principal."
+            "order creator and every amending principal."
         )
 
     record = ApprovalRecord(
@@ -319,7 +342,12 @@ def confirm_sales_order(
     policy: MarginPolicy,
     confirmed_at_utc: str,
 ) -> SalesOrder:
-    """Confirm an order only when all readiness gates evaluate to `met=True`."""
+    """Confirm an unconfirmed order when readiness gates evaluate to `met=True`."""
+    if order.status is OrderStatus.CONFIRMED:
+        raise ConflictError(
+            "Order is already confirmed.",
+            code="ORDER_ALREADY_CONFIRMED",
+        )
     gate = evaluate_margin_gate(order, policy)
     if not gate.met:
         raise MarginBlockedError(
@@ -345,12 +373,7 @@ def apply_order_amendment(
     amended_at_utc: str,
     adverse_commercial_change: bool,
 ) -> SalesOrder:
-    """Re-evaluate margin governance after an order line or header commercial amendment.
-
-    Price-lowering or discount-increasing amendments increment `pricing_version`
-    (requiring fresh approval if below floor) and automatically transition `confirmed`
-    orders back to `pending_approval` when the margin floor is breached.
-    """
+    """Re-evaluate margin governance after an order line or header commercial amendment."""
     next_pricing_version = (
         order.pricing_version + 1 if adverse_commercial_change else order.pricing_version
     )
@@ -361,6 +384,7 @@ def apply_order_amendment(
         header_discount_minor=new_header_discount_minor,
         waterfall=new_waterfall,
         last_amended_by=amended_by.principal_id,
+        amended_by_history=order.amended_by_history | {amended_by.principal_id},
         updated_at_utc=amended_at_utc,
     )
     gate = evaluate_margin_gate(candidate, policy)
@@ -416,14 +440,7 @@ def project_order_for_principal(
     policy: MarginPolicy,
     principal: PrincipalContext,
 ) -> dict[str, Any]:
-    """Capability-based order representation stripping cost/margin for unprivileged roles.
-
-    Principals lacking `valuation:cost:read` never see `unit_cost_minor`,
-    `total_cost_minor`, or `STATISTICAL_VALUATION_COST` steps. Principals lacking
-    `orders:margin:read` never see `margin_minor`, `margin_bps`, or `approved_margin_bps`.
-    Readiness gate outcome (`{gate, met, code, remediation}`) remains visible so sales
-    and warehouse staff know whether approval is required without leaking cost!
-    """
+    """Capability-based order representation stripping cost/margin for unprivileged roles."""
     can_read_cost = principal.has_capability("valuation:cost:read")
     can_read_margin = principal.has_capability("orders:margin:read")
     gate = evaluate_margin_gate(order, policy)
@@ -436,6 +453,7 @@ def project_order_for_principal(
             "reason": record.reason,
             "approved_at_utc": record.approved_at_utc,
             "approved_pricing_version": record.approved_pricing_version,
+            "approved_net_goods_minor": record.approved_net_goods_minor,
         }
         if can_read_margin:
             entry["approved_margin_bps"] = record.approved_margin_bps
@@ -459,6 +477,14 @@ def project_order_for_principal(
         "passthrough_freight_minor": order.waterfall.passthrough_freight_minor,
         "small_order_surcharge_minor": order.waterfall.small_order_surcharge_minor,
         "payable_total_minor": order.waterfall.payable_total_minor,
+        "header_steps": [
+            {
+                "kind": step.kind.value,
+                "amount_minor": step.amount_minor,
+                "is_statistical": step.is_statistical,
+            }
+            for step in order.waterfall.header_steps
+        ],
         "created_by": order.created_by,
         "last_amended_by": order.last_amended_by,
         "created_at_utc": order.created_at_utc,

@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
-from uuid import UUID
 
+from pydantic import BaseModel
+
+from ledger_guard import __version__ as SERVER_VERSION
 from ledger_guard.application.order_service import OrderLineCommand, OrderService
-from ledger_guard.domain.errors import AuthorizationError, DomainError, ValidationError
-from ledger_guard.domain.margin_gate import OrderKind, PrincipalContext
-from ledger_guard.domain.money import Currency, require_strict_int
+from ledger_guard.application.schemas import (
+    AmendOrderLineToolArgs,
+    ApproveMarginToolArgs,
+    ConfirmOrderToolArgs,
+    CreateOrderToolArgs,
+    ExportOrdersCsvToolArgs,
+    GetOrderToolArgs,
+    ListOrdersToolArgs,
+    pydantic_to_mcp_input_schema,
+    validate_mcp_arguments,
+)
+from ledger_guard.domain.errors import DomainError
+from ledger_guard.domain.margin_gate import PrincipalContext
 from ledger_guard.security.idempotency import IdempotencyCoordinator
 from ledger_guard.security.redaction import Redactor
 
-SERVER_VERSION: str = "0.2.0"
 DEFAULT_MCP_PROTOCOL_VERSION: str = "2025-03-26"
 SUPPORTED_MCP_PROTOCOL_VERSIONS: frozenset[str] = frozenset(
     {
@@ -24,432 +36,138 @@ SUPPORTED_MCP_PROTOCOL_VERSIONS: frozenset[str] = frozenset(
     }
 )
 
-_CREATE_ORDER_KEYS: frozenset[str] = frozenset(
-    {
-        "idempotency_key",
-        "customer_ref",
-        "order_kind",
-        "currency",
-        "header_discount_bps",
-        "header_discount_minor",
-        "passthrough_freight_minor",
-        "small_order_surcharge_minor",
-        "lines",
-    }
-)
-_CREATE_ORDER_LINE_KEYS: frozenset[str] = frozenset(
-    {
-        "sku",
-        "quantity",
-        "unit_price_minor",
-        "manual_discount_bps",
-    }
-)
-_GET_ORDER_KEYS: frozenset[str] = frozenset({"order_id"})
-_LIST_ORDERS_KEYS: frozenset[str] = frozenset({"limit"})
-_CONFIRM_ORDER_KEYS: frozenset[str] = frozenset(
-    {"idempotency_key", "order_id", "expected_version"}
-)
-_APPROVE_MARGIN_KEYS: frozenset[str] = frozenset(
-    {"idempotency_key", "order_id", "expected_version", "reason"}
-)
-_AMEND_ORDER_LINE_KEYS: frozenset[str] = frozenset(
-    {
-        "idempotency_key",
-        "order_id",
-        "line_id",
-        "expected_version",
-        "quantity",
-        "unit_price_minor",
-        "manual_discount_bps",
-        "header_discount_bps",
-        "header_discount_minor",
-    }
-)
-_EXPORT_ORDERS_CSV_KEYS: frozenset[str] = frozenset()
 
-MCP_TOOLS_SPEC: tuple[dict[str, Any], ...] = (
-    {
-        "name": "create_order",
-        "title": "Create Governed Order",
-        "description": (
+@dataclass(frozen=True, slots=True)
+class _ToolDescriptor:
+    name: str
+    title: str
+    description: str
+    read_only: bool
+    model: type[BaseModel]
+    required_capability: str
+    is_idempotent_mutation: bool = False
+
+
+_TOOL_REGISTRY: tuple[_ToolDescriptor, ...] = (
+    _ToolDescriptor(
+        name="create_order",
+        title="Create Governed Order",
+        description=(
             "Price and create a tenant-scoped B2B sales order using exact Fraction UoM "
             "arithmetic, immutable inventory CostSnapshots, and margin-floor governance. "
             "Requires capability 'orders:write'."
         ),
-        "annotations": {
-            "title": "Create Governed Order",
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-        },
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["idempotency_key", "customer_ref", "currency", "lines"],
-            "properties": {
-                "idempotency_key": {
-                    "type": "string",
-                    "minLength": 8,
-                    "maxLength": 128,
-                    "description": "Unique client mutation key bound to payload SHA-256.",
-                },
-                "customer_ref": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "description": "Buyer purchase order reference or account code.",
-                },
-                "order_kind": {
-                    "type": "string",
-                    "enum": [k.value for k in OrderKind],
-                    "default": "standard",
-                    "description": "Commercial order classification.",
-                },
-                "currency": {
-                    "type": "string",
-                    "enum": [c.value for c in Currency],
-                    "description": "ISO 4217 currency code.",
-                },
-                "header_discount_bps": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 10000,
-                    "description": "Proportional header discount in basis points (100 bps = 1%).",
-                },
-                "header_discount_minor": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Fixed header discount in integer minor currency units.",
-                },
-                "passthrough_freight_minor": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": (
-                        "Pass-through carrier freight in minor units "
-                        "(excluded from margin basis)."
-                    ),
-                },
-                "small_order_surcharge_minor": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": (
-                        "Small-order surcharge in minor units (excluded from margin basis)."
-                    ),
-                },
-                "lines": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 200,
-                    "description": "Commercial order lines to price.",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["sku", "quantity"],
-                        "properties": {
-                            "sku": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": 64,
-                                "description": "Catalog SKU identifier.",
-                            },
-                            "quantity": {
-                                "type": ["integer", "string"],
-                                "description": (
-                                    "Positive integer or exact rational string (e.g. '3/2')."
-                                ),
-                            },
-                            "unit_price_minor": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "description": (
-                                    "Optional selling unit price override in minor units."
-                                ),
-                            },
-                            "manual_discount_bps": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": 10000,
-                                "description": "Optional manual line discount in basis points.",
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    },
-    {
-        "name": "get_order",
-        "title": "Get Order",
-        "description": (
+        read_only=False,
+        model=CreateOrderToolArgs,
+        required_capability="orders:write",
+        is_idempotent_mutation=True,
+    ),
+    _ToolDescriptor(
+        name="get_order",
+        title="Get Order",
+        description=(
             "Fetch a single tenant-scoped sales order with capability-projected cost and "
             "margin fields. Requires capability 'orders:read'."
         ),
-        "annotations": {
-            "title": "Get Order",
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-        },
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["order_id"],
-            "properties": {
-                "order_id": {
-                    "type": "string",
-                    "format": "uuid",
-                    "description": "Target order UUID within the caller's tenant.",
-                },
-            },
-        },
-    },
-    {
-        "name": "list_orders",
-        "title": "List Orders",
-        "description": (
+        read_only=True,
+        model=GetOrderToolArgs,
+        required_capability="orders:read",
+    ),
+    _ToolDescriptor(
+        name="list_orders",
+        title="List Orders",
+        description=(
             "List recent tenant-scoped sales orders with capability-projected cost and "
             "margin fields stripped according to caller permissions. Requires 'orders:read'."
         ),
-        "annotations": {
-            "title": "List Orders",
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-        },
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 200,
-                    "default": 50,
-                    "description": "Maximum number of orders to return (1..200).",
-                },
-            },
-        },
-    },
-    {
-        "name": "confirm_order",
-        "title": "Confirm Order",
-        "description": (
+        read_only=True,
+        model=ListOrdersToolArgs,
+        required_capability="orders:read",
+    ),
+    _ToolDescriptor(
+        name="confirm_order",
+        title="Confirm Order",
+        description=(
             "Confirm a governed sales order when all readiness gates evaluate to met=true. "
             "Requires capability 'orders:confirm' and matching optimistic expected_version."
         ),
-        "annotations": {
-            "title": "Confirm Order",
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-        },
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["idempotency_key", "order_id", "expected_version"],
-            "properties": {
-                "idempotency_key": {
-                    "type": "string",
-                    "minLength": 8,
-                    "maxLength": 128,
-                    "description": "Unique client mutation key bound to payload SHA-256.",
-                },
-                "order_id": {
-                    "type": "string",
-                    "format": "uuid",
-                    "description": "Target order UUID to confirm.",
-                },
-                "expected_version": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Optimistic concurrency aggregate version.",
-                },
-            },
-        },
-    },
-    {
-        "name": "approve_margin",
-        "title": "Approve Margin Exception",
-        "description": (
+        read_only=False,
+        model=ConfirmOrderToolArgs,
+        required_capability="orders:confirm",
+        is_idempotent_mutation=True,
+    ),
+    _ToolDescriptor(
+        name="approve_margin",
+        title="Approve Margin Exception",
+        description=(
             "Record an append-only four-eyes margin exception approval with mandatory reason. "
-            "Approver must hold 'orders:margin:approve' and be distinct from creator/amender."
+            "Approver must hold 'orders:margin:approve' and be distinct from creator/amenders."
         ),
-        "annotations": {
-            "title": "Approve Margin Exception",
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-        },
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["idempotency_key", "order_id", "expected_version", "reason"],
-            "properties": {
-                "idempotency_key": {
-                    "type": "string",
-                    "minLength": 8,
-                    "maxLength": 128,
-                    "description": "Unique client mutation key bound to payload SHA-256.",
-                },
-                "order_id": {
-                    "type": "string",
-                    "format": "uuid",
-                    "description": "Target order UUID awaiting margin exception approval.",
-                },
-                "expected_version": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Optimistic concurrency aggregate version.",
-                },
-                "reason": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 1000,
-                    "description": "Commercial justification recorded in the audit trail.",
-                },
-            },
-        },
-    },
-    {
-        "name": "amend_order_line",
-        "title": "Amend Order Line",
-        "description": (
+        read_only=False,
+        model=ApproveMarginToolArgs,
+        required_capability="orders:margin:approve",
+        is_idempotent_mutation=True,
+    ),
+    _ToolDescriptor(
+        name="amend_order_line",
+        title="Amend Order Line",
+        description=(
             "Amend commercial pricing or quantity on an existing order line while preserving "
             "immutable CostSnapshots and re-evaluating margin floor gates. Requires 'orders:write'."
         ),
-        "annotations": {
-            "title": "Amend Order Line",
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-        },
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["idempotency_key", "order_id", "line_id", "expected_version"],
-            "properties": {
-                "idempotency_key": {
-                    "type": "string",
-                    "minLength": 8,
-                    "maxLength": 128,
-                    "description": "Unique client mutation key bound to payload SHA-256.",
-                },
-                "order_id": {
-                    "type": "string",
-                    "format": "uuid",
-                    "description": "Target order UUID.",
-                },
-                "line_id": {
-                    "type": "string",
-                    "format": "uuid",
-                    "description": "Target line UUID on the order.",
-                },
-                "expected_version": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Optimistic concurrency aggregate version.",
-                },
-                "quantity": {
-                    "type": ["integer", "string"],
-                    "description": "Updated positive integer or rational quantity string.",
-                },
-                "unit_price_minor": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Updated selling unit price in minor units.",
-                },
-                "manual_discount_bps": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 10000,
-                    "description": "Updated manual line discount in basis points.",
-                },
-                "header_discount_bps": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 10000,
-                    "description": "Updated proportional header discount in basis points.",
-                },
-                "header_discount_minor": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Updated fixed header discount in minor units.",
-                },
-            },
-        },
-    },
-    {
-        "name": "export_orders_csv",
-        "title": "Export Orders CSV",
-        "description": (
+        read_only=False,
+        model=AmendOrderLineToolArgs,
+        required_capability="orders:write",
+        is_idempotent_mutation=True,
+    ),
+    _ToolDescriptor(
+        name="export_orders_csv",
+        title="Export Orders CSV",
+        description=(
             "Export tenant orders as formula-injection-sanitized CSV with cost and margin "
             "columns gated by 'valuation:cost:read' and 'orders:margin:read'. "
             "Requires 'orders:export'."
         ),
+        read_only=True,
+        model=ExportOrdersCsvToolArgs,
+        required_capability="orders:export",
+    ),
+)
+
+_TOOLS_BY_NAME: dict[str, _ToolDescriptor] = {item.name: item for item in _TOOL_REGISTRY}
+
+MCP_TOOLS_SPEC: tuple[dict[str, Any], ...] = tuple(
+    {
+        "name": desc.name,
+        "title": desc.title,
+        "description": desc.description,
         "annotations": {
-            "title": "Export Orders CSV",
-            "readOnlyHint": True,
+            "title": desc.title,
+            "readOnlyHint": desc.read_only,
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False,
         },
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {},
-        },
-    },
+        "inputSchema": pydantic_to_mcp_input_schema(desc.model),
+    }
+    for desc in _TOOL_REGISTRY
 )
 
 
-def _parse_uuid_arg(raw: object, field_name: str) -> UUID:
-    if not isinstance(raw, str):
-        raise ValidationError(f"Field '{field_name}' must be a UUID string.")
-    try:
-        return UUID(raw.strip())
-    except ValueError as exc:
-        raise ValidationError(f"Field '{field_name}' is not a valid UUID.") from exc
-
-
-def _require_str_arg(args: Mapping[str, Any], field_name: str) -> str:
-    raw = args.get(field_name)
-    if not isinstance(raw, str):
-        raise ValidationError(f"Field '{field_name}' must be a string.")
-    return raw
-
-
-def _reject_client_tenant_override(args: Mapping[str, Any]) -> None:
-    if "tenant_id" in args:
-        raise AuthorizationError(
-            "Client-supplied tenant_id is forbidden; tenant scope is bound server-side.",
-            code="CLIENT_TENANT_OVERRIDE_FORBIDDEN",
-        )
-
-
-def _validate_allowed_keys(
-    args: Mapping[str, Any],
-    allowed_keys: frozenset[str],
-    context: str,
-) -> None:
-    _reject_client_tenant_override(args)
-    unknown = sorted(set(args.keys()) - allowed_keys)
-    if unknown:
-        raise ValidationError(
-            f"Unknown argument(s) for {context}: {', '.join(unknown)}.",
-            code="UNKNOWN_TOOL_ARGUMENTS",
-            details={"unknown_arguments": unknown},
-        )
+def _is_valid_jsonrpc_id(raw_id: object) -> bool:
+    if raw_id is None:
+        return True
+    if isinstance(raw_id, bool):
+        return False
+    if isinstance(raw_id, int):
+        return True
+    if isinstance(raw_id, str):
+        return len(raw_id) <= 128
+    return False
 
 
 class McpToolServer:
-    """MCP JSON-RPC 2.0 dispatcher enforcing identical RBAC, idempotency, and projection."""
+    """MCP JSON-RPC 2.0 dispatcher sharing Pydantic contracts and `OrderService`."""
 
     def __init__(
         self,
@@ -468,8 +186,11 @@ class McpToolServer:
         rpc_request: Mapping[str, Any],
     ) -> dict[str, Any] | None:
         """Handle an MCP JSON-RPC 2.0 request or notification (`None` for notifications)."""
-        is_notification = "id" not in rpc_request
+        has_id = "id" in rpc_request
         req_id = rpc_request.get("id")
+        if has_id and not _is_valid_jsonrpc_id(req_id):
+            return self._rpc_error(None, -32600, "Invalid Request: invalid JSON-RPC 'id'.")
+
         if rpc_request.get("jsonrpc") != "2.0":
             return self._rpc_error(req_id, -32600, "Invalid Request: jsonrpc must be '2.0'.")
 
@@ -477,7 +198,12 @@ class McpToolServer:
         if not isinstance(method, str) or not method:
             return self._rpc_error(req_id, -32600, "Invalid Request: method string required.")
 
-        if is_notification or method.startswith("notifications/"):
+        if method.startswith("notifications/"):
+            if has_id:
+                return self._rpc_error(req_id, -32600, "Notifications must not contain 'id'.")
+            return None
+
+        if not has_id:
             return None
 
         if method == "initialize":
@@ -502,32 +228,10 @@ class McpToolServer:
             }
 
         if method == "ping":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {},
-            }
+            return {"jsonrpc": "2.0", "id": req_id, "result": {}}
 
         if method == "tools/list":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"tools": list(MCP_TOOLS_SPEC)},
-            }
-
-        if method == "resources/list":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"resources": []},
-            }
-
-        if method == "prompts/list":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"prompts": []},
-            }
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": list(MCP_TOOLS_SPEC)}}
 
         if method == "tools/call":
             params = rpc_request.get("params")
@@ -543,6 +247,37 @@ class McpToolServer:
 
         return self._rpc_error(req_id, -32601, f"Method '{method}' not supported.")
 
+    def _run_idempotent_order_mutation(
+        self,
+        *,
+        req_id: Any,
+        principal: PrincipalContext,
+        action: str,
+        idempotency_key: str,
+        payload: dict[str, Any],
+        status_code: int,
+        executor: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        outcome = self._idempotency.execute(
+            tenant_id=principal.tenant_id,
+            principal_id=principal.principal_id,
+            action=action,
+            idempotency_key=idempotency_key,
+            payload=payload,
+            handler=lambda: (status_code, executor()),
+        )
+        body = outcome.body
+        if outcome.replayed and "order_id" in body:
+            from uuid import UUID
+
+            order, policy = self._orders._get_order_and_policy(
+                principal, UUID(str(body["order_id"]))
+            )
+            from ledger_guard.domain.margin_gate import project_order_for_principal
+
+            body = project_order_for_principal(order, policy, principal)
+        return self._tool_success(req_id, body, replayed=outcome.replayed)
+
     def _dispatch_tool(
         self,
         req_id: Any,
@@ -550,107 +285,132 @@ class McpToolServer:
         tool_name: str,
         args: Mapping[str, Any],
     ) -> dict[str, Any]:
+        desc = _TOOLS_BY_NAME.get(tool_name)
+        if desc is None:
+            return self._rpc_error(req_id, -32601, f"Unknown MCP tool '{tool_name}'.")
+
         try:
-            _reject_client_tenant_override(args)
+            validated = validate_mcp_arguments(desc.model, args)
+            principal.require_capability(desc.required_capability)
 
-            if tool_name == "get_order":
-                _validate_allowed_keys(args, _GET_ORDER_KEYS, "get_order")
-                order_id = _parse_uuid_arg(args.get("order_id"), "order_id")
-                result_payload = self._orders.get_order(principal, order_id=order_id)
-                return self._tool_success(req_id, result_payload, replayed=False)
-
-            if tool_name == "list_orders":
-                _validate_allowed_keys(args, _LIST_ORDERS_KEYS, "list_orders")
-                raw_limit = args.get("limit", 50)
-                limit = require_strict_int(raw_limit, "limit")
-                result_payload = self._orders.list_orders(principal, limit=limit)
-                return self._tool_success(req_id, result_payload, replayed=False)
-
-            if tool_name == "export_orders_csv":
-                _validate_allowed_keys(args, _EXPORT_ORDERS_CSV_KEYS, "export_orders_csv")
-                csv_text = self._orders.export_orders_csv(principal)
-                line_count = max(0, len(csv_text.splitlines()) - 1)
+            if isinstance(validated, GetOrderToolArgs):
                 return self._tool_success(
                     req_id,
-                    {"csv": csv_text, "row_count": line_count},
+                    self._orders.get_order(principal, order_id=validated.order_id),
                     replayed=False,
                 )
 
-            if tool_name == "create_order":
-                _validate_allowed_keys(args, _CREATE_ORDER_KEYS, "create_order")
-                idem_key = _require_str_arg(args, "idempotency_key")
-                outcome = self._idempotency.execute(
-                    tenant_id=principal.tenant_id,
-                    principal_id=principal.principal_id,
-                    action="mcp:create_order",
-                    idempotency_key=idem_key,
-                    payload=dict(args),
-                    handler=lambda: (201, self._exec_create_order(principal, args)),
+            if isinstance(validated, ListOrdersToolArgs):
+                return self._tool_success(
+                    req_id,
+                    self._orders.list_orders(principal, limit=validated.limit),
+                    replayed=False,
                 )
-                return self._tool_success(req_id, outcome.body, replayed=outcome.replayed)
 
-            if tool_name == "confirm_order":
-                _validate_allowed_keys(args, _CONFIRM_ORDER_KEYS, "confirm_order")
-                idem_key = _require_str_arg(args, "idempotency_key")
-                order_id = _parse_uuid_arg(args.get("order_id"), "order_id")
-                exp_ver = require_strict_int(args.get("expected_version"), "expected_version")
-                outcome = self._idempotency.execute(
-                    tenant_id=principal.tenant_id,
-                    principal_id=principal.principal_id,
-                    action=f"mcp:confirm_order:{order_id}",
-                    idempotency_key=idem_key,
-                    payload=dict(args),
-                    handler=lambda: (
-                        200,
-                        self._orders.confirm_order(
-                            principal, order_id=order_id, expected_version=exp_ver
-                        ),
+            if isinstance(validated, ExportOrdersCsvToolArgs):
+                csv_text = self._orders.export_orders_csv(principal)
+                row_count = max(0, len(csv_text.splitlines()) - 1)
+                return self._tool_success(
+                    req_id,
+                    {"csv": csv_text, "row_count": row_count},
+                    replayed=False,
+                )
+
+            if isinstance(validated, CreateOrderToolArgs):
+                commands = [
+                    OrderLineCommand(
+                        sku=ln.sku,
+                        quantity=ln.quantity,
+                        unit_price_minor=ln.unit_price_minor,
+                        manual_discount_bps=ln.manual_discount_bps,
+                    )
+                    for ln in validated.lines
+                ]
+                canonical_payload = validated.model_dump(
+                    mode="json", exclude={"idempotency_key"}
+                )
+                return self._run_idempotent_order_mutation(
+                    req_id=req_id,
+                    principal=principal,
+                    action="orders:create",
+                    idempotency_key=validated.idempotency_key,
+                    payload=canonical_payload,
+                    status_code=201,
+                    executor=lambda: self._orders.create_order(
+                        principal,
+                        customer_ref=validated.customer_ref,
+                        order_kind=validated.order_kind,
+                        currency=validated.currency,
+                        lines=commands,
+                        header_discount_bps=validated.header_discount_bps,
+                        header_discount_minor=validated.header_discount_minor,
+                        passthrough_freight_minor=validated.passthrough_freight_minor,
+                        small_order_surcharge_minor=validated.small_order_surcharge_minor,
                     ),
                 )
-                return self._tool_success(req_id, outcome.body, replayed=outcome.replayed)
 
-            if tool_name == "approve_margin":
-                _validate_allowed_keys(args, _APPROVE_MARGIN_KEYS, "approve_margin")
-                idem_key = _require_str_arg(args, "idempotency_key")
-                order_id = _parse_uuid_arg(args.get("order_id"), "order_id")
-                exp_ver = require_strict_int(args.get("expected_version"), "expected_version")
-                reason = _require_str_arg(args, "reason")
-                outcome = self._idempotency.execute(
-                    tenant_id=principal.tenant_id,
-                    principal_id=principal.principal_id,
-                    action=f"mcp:approve_margin:{order_id}",
-                    idempotency_key=idem_key,
-                    payload=dict(args),
-                    handler=lambda: (
-                        200,
-                        self._orders.approve_margin(
-                            principal,
-                            order_id=order_id,
-                            expected_version=exp_ver,
-                            reason=reason,
-                        ),
+            if isinstance(validated, ConfirmOrderToolArgs):
+                canonical_payload = validated.model_dump(
+                    mode="json", exclude={"idempotency_key", "order_id"}
+                )
+                return self._run_idempotent_order_mutation(
+                    req_id=req_id,
+                    principal=principal,
+                    action=f"orders:confirm:{validated.order_id}",
+                    idempotency_key=validated.idempotency_key,
+                    payload=canonical_payload,
+                    status_code=200,
+                    executor=lambda: self._orders.confirm_order(
+                        principal,
+                        order_id=validated.order_id,
+                        expected_version=validated.expected_version,
                     ),
                 )
-                return self._tool_success(req_id, outcome.body, replayed=outcome.replayed)
 
-            if tool_name == "amend_order_line":
-                _validate_allowed_keys(args, _AMEND_ORDER_LINE_KEYS, "amend_order_line")
-                idem_key = _require_str_arg(args, "idempotency_key")
-                order_id = _parse_uuid_arg(args.get("order_id"), "order_id")
-                line_id = _parse_uuid_arg(args.get("line_id"), "line_id")
-                exp_ver = require_strict_int(args.get("expected_version"), "expected_version")
-                outcome = self._idempotency.execute(
-                    tenant_id=principal.tenant_id,
-                    principal_id=principal.principal_id,
-                    action=f"mcp:amend_order_line:{order_id}:{line_id}",
-                    idempotency_key=idem_key,
-                    payload=dict(args),
-                    handler=lambda: (
-                        200,
-                        self._exec_amend_line(principal, order_id, line_id, exp_ver, args),
+            if isinstance(validated, ApproveMarginToolArgs):
+                canonical_payload = validated.model_dump(
+                    mode="json", exclude={"idempotency_key", "order_id"}
+                )
+                return self._run_idempotent_order_mutation(
+                    req_id=req_id,
+                    principal=principal,
+                    action=f"orders:approve_margin:{validated.order_id}",
+                    idempotency_key=validated.idempotency_key,
+                    payload=canonical_payload,
+                    status_code=200,
+                    executor=lambda: self._orders.approve_margin(
+                        principal,
+                        order_id=validated.order_id,
+                        expected_version=validated.expected_version,
+                        reason=validated.reason,
                     ),
                 )
-                return self._tool_success(req_id, outcome.body, replayed=outcome.replayed)
+
+            if isinstance(validated, AmendOrderLineToolArgs):
+                canonical_payload = validated.model_dump(
+                    mode="json",
+                    exclude={"idempotency_key", "order_id", "line_id"},
+                    exclude_none=True,
+                )
+                return self._run_idempotent_order_mutation(
+                    req_id=req_id,
+                    principal=principal,
+                    action=f"orders:amend_line:{validated.order_id}:{validated.line_id}",
+                    idempotency_key=validated.idempotency_key,
+                    payload=canonical_payload,
+                    status_code=200,
+                    executor=lambda: self._orders.amend_order_line(
+                        principal,
+                        order_id=validated.order_id,
+                        line_id=validated.line_id,
+                        expected_version=validated.expected_version,
+                        quantity=validated.quantity,
+                        unit_price_minor=validated.unit_price_minor,
+                        manual_discount_bps=validated.manual_discount_bps,
+                        header_discount_bps=validated.header_discount_bps,
+                        header_discount_minor=validated.header_discount_minor,
+                    ),
+                )
 
             return self._rpc_error(req_id, -32601, f"Unknown MCP tool '{tool_name}'.")
         except DomainError as err:
@@ -669,123 +429,6 @@ class McpToolServer:
                     "isError": True,
                 },
             }
-
-    def _exec_create_order(
-        self,
-        principal: PrincipalContext,
-        args: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        raw_lines = args.get("lines")
-        if not isinstance(raw_lines, list) or not raw_lines:
-            raise ValidationError("MCP create_order requires a non-empty 'lines' array.")
-
-        commands: list[OrderLineCommand] = []
-        for idx, entry in enumerate(raw_lines):
-            if not isinstance(entry, Mapping):
-                raise ValidationError("Each line entry must be an object.")
-            _validate_allowed_keys(entry, _CREATE_ORDER_LINE_KEYS, f"create_order.lines[{idx}]")
-            sku = _require_str_arg(entry, "sku")
-            raw_qty = entry.get("quantity")
-            if not isinstance(raw_qty, (int, str)) or isinstance(raw_qty, bool):
-                raise ValidationError("Line quantity must be integer or rational string.")
-            raw_price = entry.get("unit_price_minor")
-            unit_price = (
-                None if raw_price is None else require_strict_int(raw_price, "unit_price_minor")
-            )
-            disc_bps = require_strict_int(
-                entry.get("manual_discount_bps", 0), "manual_discount_bps"
-            )
-            commands.append(
-                OrderLineCommand(
-                    sku=sku,
-                    quantity=raw_qty,
-                    unit_price_minor=unit_price,
-                    manual_discount_bps=disc_bps,
-                )
-            )
-
-        raw_currency = _require_str_arg(args, "currency")
-        try:
-            currency = Currency(raw_currency)
-        except ValueError as exc:
-            raise ValidationError("Unsupported currency code.") from exc
-
-        raw_order_kind = args.get("order_kind", "standard")
-        if not isinstance(raw_order_kind, str):
-            raise ValidationError("Field 'order_kind' must be a string.")
-        try:
-            order_kind = OrderKind(raw_order_kind)
-        except ValueError as exc:
-            raise ValidationError("Unsupported order_kind classification.") from exc
-
-        customer_ref = _require_str_arg(args, "customer_ref")
-
-        return self._orders.create_order(
-            principal,
-            customer_ref=customer_ref,
-            order_kind=order_kind,
-            currency=currency,
-            lines=commands,
-            header_discount_bps=require_strict_int(
-                args.get("header_discount_bps", 0), "header_discount_bps"
-            ),
-            header_discount_minor=require_strict_int(
-                args.get("header_discount_minor", 0), "header_discount_minor"
-            ),
-            passthrough_freight_minor=require_strict_int(
-                args.get("passthrough_freight_minor", 0), "passthrough_freight_minor"
-            ),
-            small_order_surcharge_minor=require_strict_int(
-                args.get("small_order_surcharge_minor", 0), "small_order_surcharge_minor"
-            ),
-        )
-
-    def _exec_amend_line(
-        self,
-        principal: PrincipalContext,
-        order_id: UUID,
-        line_id: UUID,
-        expected_version: int,
-        args: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        raw_qty = args.get("quantity")
-        if raw_qty is not None and (
-            not isinstance(raw_qty, (int, str)) or isinstance(raw_qty, bool)
-        ):
-            raise ValidationError("quantity must be integer or rational string.")
-
-        raw_price = args.get("unit_price_minor")
-        unit_price = (
-            None if raw_price is None else require_strict_int(raw_price, "unit_price_minor")
-        )
-        raw_disc = args.get("manual_discount_bps")
-        manual_disc = (
-            None if raw_disc is None else require_strict_int(raw_disc, "manual_discount_bps")
-        )
-        raw_hdr_bps = args.get("header_discount_bps")
-        hdr_bps = (
-            None
-            if raw_hdr_bps is None
-            else require_strict_int(raw_hdr_bps, "header_discount_bps")
-        )
-        raw_hdr_minor = args.get("header_discount_minor")
-        hdr_minor = (
-            None
-            if raw_hdr_minor is None
-            else require_strict_int(raw_hdr_minor, "header_discount_minor")
-        )
-
-        return self._orders.amend_order_line(
-            principal,
-            order_id=order_id,
-            line_id=line_id,
-            expected_version=expected_version,
-            quantity=raw_qty,
-            unit_price_minor=unit_price,
-            manual_discount_bps=manual_disc,
-            header_discount_bps=hdr_bps,
-            header_discount_minor=hdr_minor,
-        )
 
     @staticmethod
     def _tool_success(

@@ -1,5 +1,7 @@
 """FastAPI HTTP transport and MCP JSON-RPC mount with OWASP ASVS L2 defence pipeline."""
 
+from __future__ import annotations
+
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -8,10 +10,11 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from ledger_guard import __version__ as PACKAGE_VERSION
 from ledger_guard.adapters.in_memory import (
     InMemoryAuditOutbox,
     InMemoryCatalogAdapter,
@@ -22,17 +25,31 @@ from ledger_guard.adapters.in_memory import (
     InMemoryWebhookDedupStore,
 )
 from ledger_guard.application.order_service import OrderLineCommand, OrderService
+from ledger_guard.application.sandbox import seed_reference_sandbox
+from ledger_guard.application.schemas import (
+    AmendOrderLinePayload,
+    ApproveMarginPayload,
+    ConfirmOrderPayload,
+    CreateOrderPayload,
+    DelegateTokenRequest,
+    LoginRequest,
+)
 from ledger_guard.domain.errors import (
     AuthenticationError,
     AuthorizationError,
     DomainError,
     RateLimitExceededError,
 )
-from ledger_guard.domain.margin_gate import OrderKind, PrincipalContext
-from ledger_guard.domain.money import Currency, validate_safe_text
+from ledger_guard.domain.margin_gate import PrincipalContext, project_order_for_principal
+from ledger_guard.domain.money import validate_safe_text
 from ledger_guard.mcp.server import McpToolServer
 from ledger_guard.ports import AuditEvent
-from ledger_guard.security.auth import MembershipDirectory, PasswordHasher, TokenService
+from ledger_guard.security.auth import (
+    MembershipDirectory,
+    PasswordHasher,
+    TokenService,
+    VerifiedTokenClaims,
+)
 from ledger_guard.security.idempotency import IdempotencyCoordinator
 from ledger_guard.security.middleware import (
     ROBOTS_TXT_CONTENT,
@@ -92,65 +109,12 @@ class AppContainer:
         )
 
 
-class LoginRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+@dataclass(frozen=True, slots=True)
+class AuthenticatedSession:
+    """Resolved principal context alongside verified `lg1` token metadata."""
 
-    tenant_id: UUID
-    principal_id: str = Field(min_length=1, max_length=128)
-    password: str = Field(min_length=1, max_length=256)
-
-
-class DelegateTokenRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    capabilities: list[str] = Field(min_length=1, max_length=32)
-    ttl_seconds: StrictInt = Field(default=900, ge=60, le=3_600)
-
-
-class CreateOrderLinePayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    sku: str = Field(min_length=1, max_length=64)
-    quantity: StrictInt | str
-    unit_price_minor: StrictInt | None = Field(default=None, ge=0)
-    manual_discount_bps: StrictInt = Field(default=0, ge=0, le=10_000)
-
-
-class CreateOrderPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    customer_ref: str = Field(min_length=1, max_length=128)
-    order_kind: OrderKind = OrderKind.STANDARD
-    currency: Currency
-    header_discount_bps: StrictInt = Field(default=0, ge=0, le=10_000)
-    header_discount_minor: StrictInt = Field(default=0, ge=0)
-    passthrough_freight_minor: StrictInt = Field(default=0, ge=0)
-    small_order_surcharge_minor: StrictInt = Field(default=0, ge=0)
-    lines: list[CreateOrderLinePayload] = Field(min_length=1, max_length=200)
-
-
-class ConfirmOrderPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    expected_version: StrictInt = Field(ge=1)
-
-
-class ApproveMarginPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    expected_version: StrictInt = Field(ge=1)
-    reason: str = Field(min_length=1, max_length=1_000)
-
-
-class AmendOrderLinePayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    expected_version: StrictInt = Field(ge=1)
-    quantity: StrictInt | str | None = None
-    unit_price_minor: StrictInt | None = Field(default=None, ge=0)
-    manual_discount_bps: StrictInt | None = Field(default=None, ge=0, le=10_000)
-    header_discount_bps: StrictInt | None = Field(default=None, ge=0, le=10_000)
-    header_discount_minor: StrictInt | None = Field(default=None, ge=0)
+    principal: PrincipalContext
+    claims: VerifiedTokenClaims
 
 
 def _client_ip_from_request(request: Request) -> str:
@@ -159,7 +123,83 @@ def _client_ip_from_request(request: Request) -> str:
         return state_ip
     if request.client is not None:
         return request.client.host
-    return "127.0.0.1"
+    return "untrusted_peer"
+
+
+def _execute_idempotent_json(
+    *,
+    deps: AppContainer,
+    principal: PrincipalContext,
+    required_capability: str,
+    action: str,
+    idempotency_key: str | None,
+    payload: dict[str, Any],
+    status_code: int,
+    executor: Callable[[], dict[str, Any]],
+) -> JSONResponse:
+    """Check RBAC before idempotency replay and re-project cached orders for caller."""
+    principal.require_capability(required_capability)
+    outcome = deps.idempotency.execute(
+        tenant_id=principal.tenant_id,
+        principal_id=principal.principal_id,
+        action=action,
+        idempotency_key=idempotency_key,
+        payload=payload,
+        handler=lambda: (status_code, executor()),
+    )
+    body = outcome.body
+    if outcome.replayed and "order_id" in body:
+        order, policy = deps.order_service._get_order_and_policy(
+            principal, UUID(str(body["order_id"]))
+        )
+        body = project_order_for_principal(order, policy, principal)
+    headers = {"X-Idempotent-Replay": "true"} if outcome.replayed else {}
+    return JSONResponse(status_code=outcome.status_code, content=body, headers=headers)
+
+
+def _require_authenticated_session(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> AuthenticatedSession:
+    deps = getattr(request.app.state, "container", None)
+    if not isinstance(deps, AppContainer):
+        raise RuntimeError("Application container is missing from app.state.")
+    client_ip = _client_ip_from_request(request)
+    cached = getattr(request.state, "verified_auth", None)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        principal, claims = cached
+        deps.rate_limiter.check_request(
+            client_ip=client_ip,
+            principal_id=principal.principal_id,
+            tenant_id=str(principal.tenant_id),
+            enforce_principal_bucket=False,
+        )
+        return AuthenticatedSession(principal=principal, claims=claims)
+
+    # Enforce IP quota before parsing/verifying untrusted or forged bearer tokens
+    deps.rate_limiter.check_request(
+        client_ip=client_ip,
+        enforce_principal_bucket=False,
+    )
+    if not authorization:
+        raise AuthenticationError("Missing Authorization Bearer header.")
+    parts = authorization.strip().split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise AuthenticationError("Authorization header must use Bearer scheme.")
+
+    claims = deps.tokens.verify_token(parts[1])
+    principal = deps.memberships.resolve_scoped_principal(
+        claims.tenant_id,
+        claims.principal_id,
+        claims.scoped_capabilities,
+    )
+    return AuthenticatedSession(principal=principal, claims=claims)
+
+
+def _require_authenticated_principal(
+    session: Annotated[AuthenticatedSession, Depends(_require_authenticated_session)],
+) -> PrincipalContext:
+    return session.principal
 
 
 def create_app(container: AppContainer | None = None) -> FastAPI:
@@ -169,7 +209,7 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
 
     app = FastAPI(
         title="LedgerGuard API",
-        version="0.2.0",
+        version=PACKAGE_VERSION,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -202,7 +242,13 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
     async def handle_validation_error(
         _request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        sanitized_errors = deps.redactor.redact_structure(exc.errors())
+        raw_issues = [
+            {k: v for k, v in err.items() if k != "input"}
+            if isinstance(err, dict)
+            else err
+            for err in exc.errors()
+        ]
+        sanitized_errors = deps.redactor.redact_structure(raw_issues)
         return JSONResponse(
             status_code=422,
             content={
@@ -227,30 +273,6 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
             },
         )
 
-    def require_authenticated_principal(
-        request: Request,
-        authorization: Annotated[str | None, Header()] = None,
-    ) -> PrincipalContext:
-        if not authorization:
-            raise AuthenticationError("Missing Authorization Bearer header.")
-        parts = authorization.strip().split(" ", 1)
-        if len(parts) != 2 or parts[0].lower() != "bearer":
-            raise AuthenticationError("Authorization header must use Bearer scheme.")
-
-        claims = deps.tokens.verify_token(parts[1])
-        principal = deps.memberships.resolve_scoped_principal(
-            claims.tenant_id,
-            claims.principal_id,
-            claims.scoped_capabilities,
-        )
-        deps.rate_limiter.check_request(
-            client_ip=_client_ip_from_request(request),
-            principal_id=principal.principal_id,
-            tenant_id=str(principal.tenant_id),
-            enforce_principal_bucket=False,
-        )
-        return principal
-
     @app.get("/robots.txt", include_in_schema=False)
     async def robots_txt() -> PlainTextResponse:
         return PlainTextResponse(content=ROBOTS_TXT_CONTENT, media_type="text/plain")
@@ -273,12 +295,22 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
             record is None
             or not record.principal.is_active
             or record.password_hash is None
-            or not deps.password_hasher.verify_password(payload.password, record.password_hash)
         ):
+            await run_in_threadpool(deps.password_hasher.verify_dummy, payload.password)
             raise AuthenticationError("Invalid credentials.", code="INVALID_CREDENTIALS")
 
-        # Reset principal strike counter on valid login while preserving IP spray bucket!
-        deps.rate_limiter.clear_principal_on_login(record.principal.principal_id)
+        password_ok = await run_in_threadpool(
+            deps.password_hasher.verify_password,
+            payload.password,
+            record.password_hash,
+        )
+        if not password_ok:
+            raise AuthenticationError("Invalid credentials.", code="INVALID_CREDENTIALS")
+
+        deps.rate_limiter.clear_principal_on_login(
+            record.principal.principal_id,
+            tenant_id=str(record.principal.tenant_id),
+        )
         access_token = deps.tokens.issue_token(
             principal_id=record.principal.principal_id,
             tenant_id=record.principal.tenant_id,
@@ -292,8 +324,14 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
     @app.post("/v1/auth/delegate-token")
     async def delegate_token_endpoint(
         payload: DelegateTokenRequest,
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        session: Annotated[AuthenticatedSession, Depends(_require_authenticated_session)],
     ) -> dict[str, Any]:
+        if session.claims.scoped_capabilities is not None:
+            raise AuthorizationError(
+                "Already-delegated agent tokens cannot re-delegate or extend lifetime.",
+                code="DELEGATED_TOKEN_CANNOT_REDELEGATE",
+            )
+        principal = session.principal
         requested = {
             validate_safe_text(cap, "capability", max_length=64) for cap in payload.capabilities
         }
@@ -332,7 +370,7 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
 
     @app.get("/v1/orders")
     async def list_orders_endpoint(
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        principal: Annotated[PrincipalContext, Depends(_require_authenticated_principal)],
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
     ) -> dict[str, Any]:
         return deps.order_service.list_orders(principal, limit=limit)
@@ -340,10 +378,9 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
     @app.post("/v1/orders")
     async def create_order_endpoint(
         payload: CreateOrderPayload,
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        principal: Annotated[PrincipalContext, Depends(_require_authenticated_principal)],
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> JSONResponse:
-        raw_dict = payload.model_dump(mode="json")
         commands = [
             OrderLineCommand(
                 sku=ln.sku,
@@ -353,38 +390,31 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
             )
             for ln in payload.lines
         ]
-        outcome = deps.idempotency.execute(
-            tenant_id=principal.tenant_id,
-            principal_id=principal.principal_id,
-            action="http:create_order",
+        return _execute_idempotent_json(
+            deps=deps,
+            principal=principal,
+            required_capability="orders:write",
+            action="orders:create",
             idempotency_key=idempotency_key,
-            payload=raw_dict,
-            handler=lambda: (
-                201,
-                deps.order_service.create_order(
-                    principal,
-                    customer_ref=payload.customer_ref,
-                    order_kind=payload.order_kind,
-                    currency=payload.currency,
-                    lines=commands,
-                    header_discount_bps=payload.header_discount_bps,
-                    header_discount_minor=payload.header_discount_minor,
-                    passthrough_freight_minor=payload.passthrough_freight_minor,
-                    small_order_surcharge_minor=payload.small_order_surcharge_minor,
-                ),
+            payload=payload.model_dump(mode="json"),
+            status_code=201,
+            executor=lambda: deps.order_service.create_order(
+                principal,
+                customer_ref=payload.customer_ref,
+                order_kind=payload.order_kind,
+                currency=payload.currency,
+                lines=commands,
+                header_discount_bps=payload.header_discount_bps,
+                header_discount_minor=payload.header_discount_minor,
+                passthrough_freight_minor=payload.passthrough_freight_minor,
+                small_order_surcharge_minor=payload.small_order_surcharge_minor,
             ),
-        )
-        headers = {"X-Idempotent-Replay": "true"} if outcome.replayed else {}
-        return JSONResponse(
-            status_code=outcome.status_code,
-            content=outcome.body,
-            headers=headers,
         )
 
     @app.get("/v1/orders/{order_id}")
     async def get_order_endpoint(
         order_id: UUID,
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        principal: Annotated[PrincipalContext, Depends(_require_authenticated_principal)],
     ) -> dict[str, Any]:
         return deps.order_service.get_order(principal, order_id=order_id)
 
@@ -392,59 +422,45 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
     async def confirm_order_endpoint(
         order_id: UUID,
         payload: ConfirmOrderPayload,
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        principal: Annotated[PrincipalContext, Depends(_require_authenticated_principal)],
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> JSONResponse:
-        outcome = deps.idempotency.execute(
-            tenant_id=principal.tenant_id,
-            principal_id=principal.principal_id,
-            action=f"http:confirm_order:{order_id}",
+        return _execute_idempotent_json(
+            deps=deps,
+            principal=principal,
+            required_capability="orders:confirm",
+            action=f"orders:confirm:{order_id}",
             idempotency_key=idempotency_key,
             payload=payload.model_dump(mode="json"),
-            handler=lambda: (
-                200,
-                deps.order_service.confirm_order(
-                    principal,
-                    order_id=order_id,
-                    expected_version=payload.expected_version,
-                ),
+            status_code=200,
+            executor=lambda: deps.order_service.confirm_order(
+                principal,
+                order_id=order_id,
+                expected_version=payload.expected_version,
             ),
-        )
-        headers = {"X-Idempotent-Replay": "true"} if outcome.replayed else {}
-        return JSONResponse(
-            status_code=outcome.status_code,
-            content=outcome.body,
-            headers=headers,
         )
 
     @app.post("/v1/orders/{order_id}/approve-margin")
     async def approve_margin_endpoint(
         order_id: UUID,
         payload: ApproveMarginPayload,
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        principal: Annotated[PrincipalContext, Depends(_require_authenticated_principal)],
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> JSONResponse:
-        outcome = deps.idempotency.execute(
-            tenant_id=principal.tenant_id,
-            principal_id=principal.principal_id,
-            action=f"http:approve_margin:{order_id}",
+        return _execute_idempotent_json(
+            deps=deps,
+            principal=principal,
+            required_capability="orders:margin:approve",
+            action=f"orders:approve_margin:{order_id}",
             idempotency_key=idempotency_key,
             payload=payload.model_dump(mode="json"),
-            handler=lambda: (
-                200,
-                deps.order_service.approve_margin(
-                    principal,
-                    order_id=order_id,
-                    expected_version=payload.expected_version,
-                    reason=payload.reason,
-                ),
+            status_code=200,
+            executor=lambda: deps.order_service.approve_margin(
+                principal,
+                order_id=order_id,
+                expected_version=payload.expected_version,
+                reason=payload.reason,
             ),
-        )
-        headers = {"X-Idempotent-Replay": "true"} if outcome.replayed else {}
-        return JSONResponse(
-            status_code=outcome.status_code,
-            content=outcome.body,
-            headers=headers,
         )
 
     @app.patch("/v1/orders/{order_id}/lines/{line_id}")
@@ -452,40 +468,33 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
         order_id: UUID,
         line_id: UUID,
         payload: AmendOrderLinePayload,
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        principal: Annotated[PrincipalContext, Depends(_require_authenticated_principal)],
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> JSONResponse:
-        outcome = deps.idempotency.execute(
-            tenant_id=principal.tenant_id,
-            principal_id=principal.principal_id,
-            action=f"http:amend_line:{order_id}:{line_id}",
+        return _execute_idempotent_json(
+            deps=deps,
+            principal=principal,
+            required_capability="orders:write",
+            action=f"orders:amend_line:{order_id}:{line_id}",
             idempotency_key=idempotency_key,
             payload=payload.model_dump(mode="json", exclude_none=True),
-            handler=lambda: (
-                200,
-                deps.order_service.amend_order_line(
-                    principal,
-                    order_id=order_id,
-                    line_id=line_id,
-                    expected_version=payload.expected_version,
-                    quantity=payload.quantity,
-                    unit_price_minor=payload.unit_price_minor,
-                    manual_discount_bps=payload.manual_discount_bps,
-                    header_discount_bps=payload.header_discount_bps,
-                    header_discount_minor=payload.header_discount_minor,
-                ),
+            status_code=200,
+            executor=lambda: deps.order_service.amend_order_line(
+                principal,
+                order_id=order_id,
+                line_id=line_id,
+                expected_version=payload.expected_version,
+                quantity=payload.quantity,
+                unit_price_minor=payload.unit_price_minor,
+                manual_discount_bps=payload.manual_discount_bps,
+                header_discount_bps=payload.header_discount_bps,
+                header_discount_minor=payload.header_discount_minor,
             ),
-        )
-        headers = {"X-Idempotent-Replay": "true"} if outcome.replayed else {}
-        return JSONResponse(
-            status_code=outcome.status_code,
-            content=outcome.body,
-            headers=headers,
         )
 
     @app.get("/v1/orders-export.csv")
     async def export_orders_csv_endpoint(
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        principal: Annotated[PrincipalContext, Depends(_require_authenticated_principal)],
     ) -> Response:
         csv_body = deps.order_service.export_orders_csv(principal)
         return Response(
@@ -503,6 +512,11 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
         x_webhook_event_id: Annotated[str | None, Header()] = None,
         x_webhook_tenant_id: Annotated[UUID | None, Header()] = None,
     ) -> dict[str, Any]:
+        deps.rate_limiter.check_request(
+            client_ip=_client_ip_from_request(request),
+            tenant_id=str(x_webhook_tenant_id) if x_webhook_tenant_id is not None else None,
+            enforce_principal_bucket=False,
+        )
         raw_bytes = await request.body()
         if x_webhook_tenant_id is None or x_webhook_event_id is None:
             raise AuthenticationError("Missing webhook tenant or event identifier header.")
@@ -520,8 +534,12 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
         if not claim.is_first_delivery:
             return {"status": "duplicate_ignored", "event_id": claim.event_id}
 
-        for callback in deps.webhook_handlers:
-            callback(claim.provider, claim.event_id, x_webhook_tenant_id, raw_bytes)
+        try:
+            for callback in deps.webhook_handlers:
+                callback(claim.provider, claim.event_id, x_webhook_tenant_id, raw_bytes)
+        except Exception:
+            deps.webhook_dedup.release_event(claim.provider, claim.event_id, x_webhook_tenant_id)
+            raise
 
         deps.outbox.append_event(
             AuditEvent(
@@ -538,12 +556,42 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
 
     @app.post("/mcp", response_model=None)
     async def mcp_jsonrpc_endpoint(
-        rpc_body: dict[str, Any],
-        principal: Annotated[PrincipalContext, Depends(require_authenticated_principal)],
+        request: Request,
+        principal: Annotated[PrincipalContext, Depends(_require_authenticated_principal)],
     ) -> Response | dict[str, Any]:
+        try:
+            rpc_body = await request.json()
+        except ValueError:
+            return {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": "Parse error: invalid JSON payload."},
+            }
+        if not isinstance(rpc_body, dict):
+            return {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Invalid Request: JSON object expected."},
+            }
         rpc_response = deps.mcp_server.handle_jsonrpc(principal, rpc_body)
         if rpc_response is None:
             return Response(status_code=202)
         return rpc_response
 
     return app
+
+
+def create_sandbox_app() -> FastAPI:
+    """Create a FastAPI + MCP app pre-seeded with the demo sandbox tenant and users."""
+    container = AppContainer()
+    seed_reference_sandbox(
+        catalog=container.catalog,
+        valuation=container.valuation,
+        policies=container.policies,
+        memberships=container.memberships,
+        orders=container.orders,
+        password_hasher=container.password_hasher,
+        include_password_hashes=True,
+        seed_pending_order=True,
+    )
+    return create_app(container)

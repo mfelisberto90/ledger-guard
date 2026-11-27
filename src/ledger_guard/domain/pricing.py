@@ -10,10 +10,12 @@ from uuid import UUID
 
 from ledger_guard.domain.errors import CurrencyMismatchError, ValidationError
 from ledger_guard.domain.money import (
+    MAX_INT32,
+    MAX_ORDER_TOTAL_MINOR,
     Currency,
     UnitRatio,
     parse_rational_quantity,
-    require_strict_int,
+    require_bounded_minor_int,
     round_rational_half_even,
     validate_safe_text,
 )
@@ -45,11 +47,10 @@ class QuantityTierDiscount:
     discount_bps: int
 
     def __post_init__(self) -> None:
-        if self.min_quantity <= 0:
-            raise ValidationError("Quantity tier min_quantity must be positive.")
-        bps = require_strict_int(self.discount_bps, "discount_bps")
-        if bps < 0 or bps > 10_000:
-            raise ValidationError("Quantity tier discount_bps must be between 0 and 10000.")
+        if not isinstance(self.min_quantity, Fraction):
+            raise ValidationError("Quantity tier min_quantity must be an exact Fraction.")
+        parse_rational_quantity(self.min_quantity, "min_quantity")
+        require_bounded_minor_int(self.discount_bps, "discount_bps", max_value=10_000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,12 +70,13 @@ class CostSnapshot:
     def __post_init__(self) -> None:
         cleaned_sku = validate_safe_text(self.sku, "sku", max_length=64)
         object.__setattr__(self, "sku", cleaned_sku)
-        cost = require_strict_int(self.base_unit_cost_minor, "base_unit_cost_minor")
-        rev = require_strict_int(self.valuation_revision, "valuation_revision")
-        if cost < 0:
-            raise ValidationError("Snapshot base_unit_cost_minor cannot be negative.")
-        if rev < 1:
-            raise ValidationError("Snapshot valuation_revision must be >= 1.")
+        require_bounded_minor_int(self.base_unit_cost_minor, "base_unit_cost_minor")
+        require_bounded_minor_int(
+            self.valuation_revision,
+            "valuation_revision",
+            min_value=1,
+            max_value=MAX_INT32,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,12 +110,8 @@ class LinePricingInput:
         object.__setattr__(self, "sku", cleaned_sku)
         object.__setattr__(self, "description", cleaned_desc)
         parse_rational_quantity(self.quantity, "quantity")
-        price = require_strict_int(self.unit_price_minor, "unit_price_minor")
-        if price < 0:
-            raise ValidationError("unit_price_minor cannot be negative.")
-        bps = require_strict_int(self.manual_discount_bps, "manual_discount_bps")
-        if bps < 0 or bps > 10_000:
-            raise ValidationError("manual_discount_bps must be between 0 and 10000.")
+        require_bounded_minor_int(self.unit_price_minor, "unit_price_minor")
+        require_bounded_minor_int(self.manual_discount_bps, "manual_discount_bps", max_value=10_000)
         if self.item_kind is ItemKind.STOCKED and self.cost_snapshot is None:
             raise ValidationError(
                 f"Stocked SKU '{self.sku}' requires an immutable inventory CostSnapshot."
@@ -127,7 +125,7 @@ class LinePricingInput:
 
 @dataclass(frozen=True, slots=True)
 class PricedOrderLine:
-    """Immutable priced order line with net-goods, statistical cost, and step trace."""
+    """Immutable priced order line preserving manual/tier rules and cost snapshot."""
 
     line_id: UUID
     sku: str
@@ -136,7 +134,9 @@ class PricedOrderLine:
     quantity: Fraction
     unit_ratio: UnitRatio
     unit_price_minor: int
+    manual_discount_bps: int
     applied_discount_bps: int
+    tier_discounts: tuple[QuantityTierDiscount, ...]
     gross_minor: int
     quantity_discount_minor: int
     header_discount_spread_minor: int
@@ -169,9 +169,10 @@ class PricedOrderWaterfall:
 
 
 def compute_margin_bps(margin_minor: int, net_goods_minor: int, total_cost_minor: int) -> int:
-    """Compute gross margin in basis points (`100 bps = 1.00%`) using `ROUND_HALF_EVEN`."""
+    """Compute bounded gross margin in basis points (`-10000..10000`) via `ROUND_HALF_EVEN`."""
     if net_goods_minor > 0:
-        return round_rational_half_even(Fraction(margin_minor * 10_000, net_goods_minor))
+        raw_bps = round_rational_half_even(Fraction(margin_minor * 10_000, net_goods_minor))
+        return max(-10_000, min(10_000, raw_bps))
     if total_cost_minor > 0:
         return -10_000
     return 0
@@ -229,26 +230,21 @@ def price_order_waterfall(
 ) -> PricedOrderWaterfall:
     """Execute the six-step commercial pricing waterfall with exact `Fraction` arithmetic.
 
-    Crucially, `passthrough_freight_minor` and `small_order_surcharge_minor` increase
-    `payable_total_minor` billed to the buyer, yet are strictly excluded from
+    `passthrough_freight_minor` and `small_order_surcharge_minor` increase
+    `payable_total_minor` billed to the buyer, yet remain excluded from
     `net_goods_total_minor` and gross margin basis.
     """
     if not lines or len(lines) > 200:
         raise ValidationError("Order must contain between 1 and 200 lines.")
 
-    hdr_bps = require_strict_int(header_discount_bps, "header_discount_bps")
-    hdr_minor = require_strict_int(header_discount_minor, "header_discount_minor")
-    freight = require_strict_int(passthrough_freight_minor, "passthrough_freight_minor")
-    surcharge = require_strict_int(small_order_surcharge_minor, "small_order_surcharge_minor")
-
-    if hdr_bps < 0 or hdr_bps > 10_000:
-        raise ValidationError("header_discount_bps must be between 0 and 10000.")
-    if hdr_minor < 0:
-        raise ValidationError("header_discount_minor cannot be negative.")
-    if freight < 0:
-        raise ValidationError("passthrough_freight_minor cannot be negative.")
-    if surcharge < 0:
-        raise ValidationError("small_order_surcharge_minor cannot be negative.")
+    hdr_bps = require_bounded_minor_int(
+        header_discount_bps, "header_discount_bps", max_value=10_000
+    )
+    hdr_minor = require_bounded_minor_int(header_discount_minor, "header_discount_minor")
+    freight = require_bounded_minor_int(passthrough_freight_minor, "passthrough_freight_minor")
+    surcharge = require_bounded_minor_int(
+        small_order_surcharge_minor, "small_order_surcharge_minor"
+    )
 
     gross_list: list[int] = []
     qty_disc_list: list[int] = []
@@ -262,6 +258,16 @@ def price_order_waterfall(
                 f"order currency ({currency.value})."
             )
         gross = round_rational_half_even(item.quantity * Fraction(item.unit_price_minor, 1))
+        require_bounded_minor_int(
+            gross,
+            "line_gross_minor",
+            max_value=MAX_ORDER_TOTAL_MINOR,
+        )
+        if item.unit_price_minor > 0 and gross == 0:
+            raise ValidationError(
+                f"Line SKU '{item.sku}' quantity and unit price round to zero minor units.",
+                code="ZERO_ROUNDED_LINE_GROSS",
+            )
         eff_bps = resolve_effective_line_discount_bps(
             item.quantity, item.manual_discount_bps, item.tier_discounts
         )
@@ -296,6 +302,11 @@ def price_order_waterfall(
             )
             unit_cost_minor = round_rational_half_even(exact_selling_cost)
             total_cost_minor = round_rational_half_even(item.quantity * exact_selling_cost)
+            require_bounded_minor_int(
+                total_cost_minor,
+                "line_total_cost_minor",
+                max_value=MAX_ORDER_TOTAL_MINOR,
+            )
         else:
             unit_cost_minor = 0
             total_cost_minor = 0
@@ -303,7 +314,7 @@ def price_order_waterfall(
         line_margin_minor = net_goods - total_cost_minor
         line_margin_bps = compute_margin_bps(line_margin_minor, net_goods, total_cost_minor)
 
-        steps: list[ConditionStep] = [
+        steps = (
             ConditionStep(ConditionStepKind.BASE_PRICE, gross, is_statistical=False),
             ConditionStep(ConditionStepKind.QUANTITY_DISCOUNT, -qty_disc, is_statistical=False),
             ConditionStep(
@@ -314,7 +325,7 @@ def price_order_waterfall(
                 total_cost_minor,
                 is_statistical=True,
             ),
-        ]
+        )
 
         priced_lines.append(
             PricedOrderLine(
@@ -325,7 +336,9 @@ def price_order_waterfall(
                 quantity=item.quantity,
                 unit_ratio=item.unit_ratio,
                 unit_price_minor=item.unit_price_minor,
+                manual_discount_bps=item.manual_discount_bps,
                 applied_discount_bps=applied_bps_list[idx],
+                tier_discounts=item.tier_discounts,
                 gross_minor=gross,
                 quantity_discount_minor=qty_disc,
                 header_discount_spread_minor=spread_disc,
@@ -335,7 +348,7 @@ def price_order_waterfall(
                 margin_minor=line_margin_minor,
                 margin_bps=line_margin_bps,
                 cost_snapshot=item.cost_snapshot,
-                steps=tuple(steps),
+                steps=steps,
             )
         )
 
@@ -344,6 +357,9 @@ def price_order_waterfall(
     margin_total = net_goods_total - total_cost
     order_margin_bps = compute_margin_bps(margin_total, net_goods_total, total_cost)
     payable_total = net_goods_total + freight + surcharge
+
+    require_bounded_minor_int(total_cost, "total_cost_minor", max_value=MAX_ORDER_TOTAL_MINOR)
+    require_bounded_minor_int(payable_total, "payable_total_minor", max_value=MAX_ORDER_TOTAL_MINOR)
 
     header_steps = (
         ConditionStep(ConditionStepKind.PASSTHROUGH_FREIGHT, freight, is_statistical=False),

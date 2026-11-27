@@ -56,17 +56,21 @@ def test_live_postgres17_force_rls_isolation_and_append_only_outbox() -> None:
             "audit_outbox, processed_webhook_events, idempotency_records, "
             "sales_orders, margin_policies, tenant_memberships"
         )
+        # Include alice as sales_rep in ALPHA and owner in BRAVO (DB-01 cross-tenant OR isolation)
         cur.execute(
             "INSERT INTO tenant_memberships "
             "(tenant_id, principal_id, role, capabilities, is_active) "
             "VALUES (%s, %s, 'sales_rep', ARRAY['orders:read','orders:write'], true), "
-            "       (%s, %s, 'sales_rep', ARRAY['orders:read','orders:write'], true), "
+            "       (%s, %s, 'owner', ARRAY['orders:read','orders:write'], true), "
+            "       (%s, %s, 'owner', ARRAY['orders:read','orders:write'], true), "
             "       (%s, %s, 'sales_rep', ARRAY['orders:read'], false)",
             (
                 str(TENANT_ALPHA),
                 "alice@alpha.example",
+                str(TENANT_ALPHA),
+                "owner@alpha.example",
                 str(TENANT_BRAVO),
-                "bob@bravo.example",
+                "alice@alpha.example",
                 str(TENANT_ALPHA),
                 "suspended@alpha.example",
             ),
@@ -81,8 +85,8 @@ def test_live_postgres17_force_rls_isolation_and_append_only_outbox() -> None:
                 0,
                 20_000,
                 13_000,
-                "bob@bravo.example",
-                "bob@bravo.example",
+                "alice@alpha.example",
+                "alice@alpha.example",
             ),
         )
 
@@ -95,8 +99,10 @@ def test_live_postgres17_force_rls_isolation_and_append_only_outbox() -> None:
             role_flags = setup_cur.fetchone()
             assert role_flags == (False, False)
 
-            # 1. Fail-closed zero-row visibility when app.current_tenant_id is unset
+            # 1. Fail-closed zero-row visibility when session GUCs are unset
             setup_cur.execute("SELECT id FROM sales_orders")
+            assert setup_cur.fetchall() == []
+            setup_cur.execute("SELECT tenant_id FROM tenant_memberships")
             assert setup_cur.fetchall() == []
 
         session = PostgresTenantSession(runtime_conn, runtime_role="app_runtime")
@@ -116,7 +122,7 @@ def test_live_postgres17_force_rls_isolation_and_append_only_outbox() -> None:
         with (
             pytest.raises(AuthorizationError) as cross_member_exc,
             session.scoped_transaction(
-                principal_id="alice@alpha.example",
+                principal_id="owner@alpha.example",
                 tenant_id=TENANT_BRAVO,
             ),
         ):
@@ -124,12 +130,17 @@ def test_live_postgres17_force_rls_isolation_and_append_only_outbox() -> None:
         assert cross_member_exc.value.code == "INACTIVE_OR_MISSING_MEMBERSHIP"
         session.assert_clean_boundary()
 
-        # 3. Valid Stage A + Stage B transaction sees strictly TENANT_ALPHA
+        # 3. Valid Stage A + Stage B transaction sees strictly TENANT_ALPHA and acquires tenant lock
         with session.scoped_transaction(
             principal_id="alice@alpha.example",
             tenant_id=TENANT_ALPHA,
         ) as cur:
             session.acquire_advisory_lock(cur, "sales_orders")
+            # Even though alice is active in BRAVO too, Stage B returns ONLY ALPHA (DB-01)!
+            cur.execute("SELECT tenant_id, principal_id FROM tenant_memberships")
+            membership_rows = cur.fetchall()
+            assert membership_rows == [(TENANT_ALPHA, "alice@alpha.example")]
+
             cur.execute(
                 _INSERT_SALES_ORDER_SQL,
                 (
@@ -159,9 +170,28 @@ def test_live_postgres17_force_rls_isolation_and_append_only_outbox() -> None:
             visible_rows = cur.fetchall()
             assert visible_rows == [(ORDER_ALPHA, "PO-ALPHA-1")]
 
+            # 3b. Cross-tenant acquire_tenant_lock is blocked inside DB function (DB-02)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                cur.execute("SELECT acquire_tenant_lock('sales_orders', %s)", (str(TENANT_BRAVO),))
+
         session.assert_clean_boundary()
 
-        # 4. Cross-tenant INSERT spoof rejected by PostgreSQL WITH CHECK policy
+        # 4. Non-owner sales_rep cannot self-elevate to 'owner' or alter margin_policies (DB-01)
+        with (
+            pytest.raises(psycopg.errors.InsufficientPrivilege),
+            session.scoped_transaction(
+                principal_id="alice@alpha.example",
+                tenant_id=TENANT_ALPHA,
+            ) as cur,
+        ):
+            cur.execute(
+                "INSERT INTO tenant_memberships "
+                "(tenant_id, principal_id, role, capabilities, is_active) "
+                "VALUES (%s, 'escalated@alpha.example', 'owner', ARRAY['orders:read'], true)",
+                (str(TENANT_ALPHA),),
+            )
+        session.assert_clean_boundary()
+
         with (
             pytest.raises(psycopg.errors.InsufficientPrivilege),
             session.scoped_transaction(
@@ -172,11 +202,40 @@ def test_live_postgres17_force_rls_isolation_and_append_only_outbox() -> None:
             cur.execute(
                 "INSERT INTO margin_policies (tenant_id, mode, minimum_margin_bps) "
                 "VALUES (%s, 'off', 0)",
+                (str(TENANT_ALPHA),),
+            )
+        session.assert_clean_boundary()
+
+        # 5. Final active owner is protected by Last-Owner trigger even under owner session (DB-01)
+        with (
+            pytest.raises(psycopg.errors.InsufficientPrivilege),
+            session.scoped_transaction(
+                principal_id="owner@alpha.example",
+                tenant_id=TENANT_ALPHA,
+            ) as cur,
+        ):
+            cur.execute(
+                "DELETE FROM tenant_memberships WHERE tenant_id = %s AND principal_id = %s",
+                (str(TENANT_ALPHA), "owner@alpha.example"),
+            )
+        session.assert_clean_boundary()
+
+        # 6. Cross-tenant INSERT spoof rejected by PostgreSQL WITH CHECK policy
+        with (
+            pytest.raises(psycopg.errors.InsufficientPrivilege),
+            session.scoped_transaction(
+                principal_id="owner@alpha.example",
+                tenant_id=TENANT_ALPHA,
+            ) as cur,
+        ):
+            cur.execute(
+                "INSERT INTO margin_policies (tenant_id, mode, minimum_margin_bps) "
+                "VALUES (%s, 'off', 0)",
                 (str(TENANT_BRAVO),),
             )
         session.assert_clean_boundary()
 
-        # 5. Append-only audit_outbox rejects DELETE and UPDATE by app_runtime
+        # 7. Append-only audit_outbox rejects DELETE and UPDATE by app_runtime
         with (
             pytest.raises(psycopg.errors.InsufficientPrivilege),
             session.scoped_transaction(
@@ -200,7 +259,7 @@ def test_live_postgres17_force_rls_isolation_and_append_only_outbox() -> None:
             )
         session.assert_clean_boundary()
 
-        # 6. SQL arithmetic CHECK constraint blocks inconsistent payable_total_minor
+        # 8. SQL arithmetic CHECK constraint blocks inconsistent payable_total_minor
         with (
             pytest.raises(psycopg.errors.CheckViolation),
             session.scoped_transaction(

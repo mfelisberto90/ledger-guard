@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Protocol
@@ -30,13 +31,7 @@ class SqlConnectionProtocol(Protocol):
 
 
 class PostgresTenantSession:
-    """Two-stage transaction-local RLS context manager safe for pooled connections.
-
-    Stage A binds `app.current_user_id` (`is_local = true`) and verifies active
-    `tenant_memberships` inside an explicit transaction.
-    Stage B binds `app.current_tenant_id` (`is_local = true`) only after membership passes.
-    `assert_clean_boundary()` guarantees zero leaked transactions on middleware exit.
-    """
+    """Two-stage transaction-local RLS context manager safe for pooled connections."""
 
     def __init__(
         self,
@@ -52,6 +47,7 @@ class PostgresTenantSession:
         self._transaction_depth = 0
         self._active_tenant_id: UUID | None = None
         self._active_principal_id: str | None = None
+        self._poisoned = False
 
     @property
     def transaction_depth(self) -> int:
@@ -73,11 +69,21 @@ class PostgresTenantSession:
             raise ValidationError("Verified non-nil tenant UUID is required.")
         normalized_principal = normalize_principal_id(principal_id)
 
+        if self._poisoned:
+            raise RuntimeError(
+                "TENANT-ABUSE-02: connection boundary was poisoned by a failed rollback."
+            )
+
         if self._transaction_depth > 0:
             if self._active_tenant_id != tenant_id:
                 raise AuthorizationError(
                     "Nested cross-tenant context switch inside an active transaction is forbidden.",
                     code="TENANT_SCOPE_ESCALATION",
+                )
+            if self._active_principal_id != normalized_principal:
+                raise AuthorizationError(
+                    "Nested cross-principal switch inside an active transaction is forbidden.",
+                    code="PRINCIPAL_SCOPE_ESCALATION",
                 )
             cursor = self._conn.cursor()
             self._transaction_depth += 1
@@ -95,13 +101,14 @@ class PostgresTenantSession:
         committed = False
         try:
             cursor.execute("BEGIN")
-            # Stage A: transaction-local user binding + active membership verification
+            # Stage A: bind transaction-local principal + target tenant for membership self-check
             cursor.execute(
-                "SELECT set_config('app.current_user_id', %s, true)",
-                (normalized_principal,),
+                "SELECT set_config('app.current_user_id', %s, true), "
+                "set_config('app.stage_a_tenant_id', %s, true)",
+                (normalized_principal, str(tenant_id)),
             )
             cursor.execute(
-                "SELECT 1 FROM tenant_memberships "
+                "SELECT role FROM tenant_memberships "
                 "WHERE principal_id = %s AND tenant_id = %s AND is_active = true",
                 (normalized_principal, str(tenant_id)),
             )
@@ -112,10 +119,12 @@ class PostgresTenantSession:
                     code="INACTIVE_OR_MISSING_MEMBERSHIP",
                 )
 
-            # Stage B: transaction-local tenant binding for FORCE RLS policies
+            db_role = str(membership_row[0]) if len(membership_row) == 1 else "sales_rep"
+            # Stage B: bind authoritative tenant_id and membership role for RESTRICTIVE RLS policies
             cursor.execute(
-                "SELECT set_config('app.current_tenant_id', %s, true)",
-                (str(tenant_id),),
+                "SELECT set_config('app.current_tenant_id', %s, true), "
+                "set_config('app.current_role', %s, true)",
+                (str(tenant_id), db_role),
             )
             yield cursor
             cursor.execute("COMMIT")
@@ -123,7 +132,17 @@ class PostgresTenantSession:
         finally:
             try:
                 if not committed:
-                    cursor.execute("ROLLBACK")
+                    active_exc = sys.exc_info()[1]
+                    try:
+                        cursor.execute("ROLLBACK")
+                    except Exception as rollback_err:
+                        self._poisoned = True
+                        if active_exc is not None:
+                            active_exc.add_note(
+                                f"Rollback also failed on poisoned connection: {rollback_err}"
+                            )
+                        else:
+                            raise
             finally:
                 self._transaction_depth = 0
                 self._active_tenant_id = None
@@ -137,12 +156,19 @@ class PostgresTenantSession:
         clean_ns = namespace.strip()
         if not clean_ns or len(clean_ns) > 64:
             raise ValidationError("Lock namespace must be 1..64 characters.")
-        lock_key = f"{clean_ns}:{self._active_tenant_id}"
-        cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+        cursor.execute(
+            "SELECT acquire_tenant_lock(%s, %s)",
+            (clean_ns, str(self._active_tenant_id)),
+        )
 
     def assert_clean_boundary(self) -> None:
-        """Middleware exit invariant (`TENANT-ABUSE-02`): forbid unclosed transactions."""
-        if self._transaction_depth != 0 or self._active_tenant_id is not None:
+        """Middleware exit invariant (`TENANT-ABUSE-02`): forbid unclosed or poisoned sessions."""
+        if (
+            self._poisoned
+            or self._transaction_depth != 0
+            or self._active_tenant_id is not None
+            or self._active_principal_id is not None
+        ):
             raise RuntimeError(
-                "TENANT-ABUSE-02: unclosed tenant transaction boundary detected at request exit."
+                "TENANT-ABUSE-02: unclosed or poisoned tenant transaction boundary at exit."
             )

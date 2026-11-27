@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Security & Financial Invariant Linter for LedgerGuard.
+"""Security & Financial Invariant Linter for LedgerGuard (`AST` + regex + SQL RLS).
 
-Adapted from the Enterprise App Security Blueprint (`enterprise-app-security-blueprint`).
 Executed in CI via `python3 scripts/security-lint.py --self-test` and `--sarif`.
 
 Enforces architectural invariants that generic SAST tools miss:
-1. SEC-LINT-001: Privileged/migrator/backup DB credentials or connections used in runtime layers.
-2. SEC-LINT-002: Trusting client-supplied tenant_id / agency_id / org_id directly into auth state.
-3. SEC-LINT-003: Fail-open null-coalescing on security/authority booleans (`is_active or True`).
-4. SEC-LINT-004: Wildcard trusted proxy (`*`) or `unsafe-eval` / `unsafe-inline` in script-src CSP.
-5. SEC-LINT-005: Raw string interpolation inside SQL queries.
-6. SEC-LINT-006: Internal recon path leaks via `Disallow: /admin|/platform|/internal` in robots.txt.
+1. SEC-LINT-001: Privileged/migrator/BYPASSRLS roles used in runtime Python code.
+2. SEC-LINT-002: Trusting client-supplied tenant_id directly into session/GUC authority.
+3. SEC-LINT-003: Fail-open defaults on authority booleans (`is_active or True`, `.get(..., True)`).
+4. SEC-LINT-004: Wildcard proxy/CORS trust (`*`) or `'unsafe-inline'`/`'unsafe-eval'` in CSP.
+5. SEC-LINT-005: Dynamic string interpolation in raw SQL `.execute()`/`.executemany()`.
+6. SEC-LINT-006: Internal recon path leaks via `Disallow: /admin|/platform|/internal`.
 7. SEC-LINT-007: Tautological placeholder assertions in test suites (`assert True`).
-8. SEC-LINT-008: Binary float usage in financial domain layer (`src/ledger_guard/domain`).
-9. SEC-LINT-009: SQL table declared without both ENABLE and FORCE ROW LEVEL SECURITY.
+8. SEC-LINT-008: AST check forbidding `float` literals, `float()`, and `/` division in domain/app.
+9. SEC-LINT-009: SQL tables missing ENABLE + FORCE RLS (or stripped by DISABLE/NO FORCE RLS).
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import sys
@@ -29,7 +29,7 @@ from typing import Any, TypedDict
 
 ROOT = Path(__file__).resolve().parent.parent
 
-SOURCE_EXTENSIONS = {".py", ".sql"}
+SOURCE_EXTENSIONS = {".py", ".sql", ".txt"}
 IGNORE_DIRS = {
     "node_modules",
     "vendor",
@@ -57,20 +57,20 @@ class LintRule(TypedDict, total=False):
 BANNED_RULES: list[LintRule] = [
     {
         "id": "SEC-LINT-001",
-        "description": "Privileged migrator/backup DB connection used in runtime code",
+        "description": "Privileged migrator/backup/BYPASSRLS DB credential or role in runtime code",
         "pattern": (
-            r"(?:pgsql_bootstrap|pgsql_migrator|pgsql_backup|"
-            r"DATABASE_MIGRATOR_URL|db_superuser)"
+            r"(?:app_migrator|pgsql_migrator|pgsql_backup|"
+            r"DATABASE_MIGRATOR_URL|db_superuser|\bBYPASSRLS\b)"
         ),
         "scope": "src",
-        "allow_marker": "RLS BYPASS JUSTIFICATION",
+        "allow_marker": "# RLS BYPASS JUSTIFICATION:",
     },
     {
         "id": "SEC-LINT-002",
-        "description": "Client request tenant/org parameter trusted directly as session authority",
+        "description": "Client request tenant parameter trusted directly as session/GUC authority",
         "pattern": (
-            r"session(?:\(\))?.*(?:selected_tenant_id|current_tenant_id)"
-            r".*(?:request|req)\.(?:input|body|query|get)"
+            r"(?:current_tenant_id|selected_tenant_id)[\s\S]{0,120}"
+            r"(?:request\.(?:headers|query_params|cookies|path_params)|payload\.tenant_id)"
         ),
         "scope": "src",
     },
@@ -78,107 +78,207 @@ BANNED_RULES: list[LintRule] = [
         "id": "SEC-LINT-003",
         "description": "Fail-open default on authority flag is prohibited (must fail closed)",
         "pattern": (
-            r"\b(?:is_active|is_admin|is_owner|has_access|is_verified|authorized)"
-            r"\s*(?:\?\?|\|\||\bor\b)\s*(?:true|True|1)\b"
+            r"(?:\b(?:is_active|is_admin|is_owner|has_access|is_verified|authorized)"
+            r"\s*\bor\b\s*(?:True|1)\b"
+            r"|\.(?:get|setdefault)\s*\(\s*['\"]"
+            r"(?:is_active|is_admin|is_owner|has_access|is_verified|authorized)"
+            r"['\"]\s*,\s*(?:True|1)\b"
+            r"|getattr\s*\([^,]+,\s*['\"]"
+            r"(?:is_active|is_admin|is_owner|has_access|is_verified|authorized)"
+            r"['\"]\s*,\s*(?:True|1)\b)"
         ),
         "scope": "src",
     },
     {
         "id": "SEC-LINT-004",
-        "description": "Unsafe wildcard proxy trust or unsafe-inline/unsafe-eval in CSP",
+        "description": "Wildcard proxy/CORS trust or unsafe-inline/unsafe-eval in CSP",
         "pattern": (
-            r"(?:['\"]unsafe-eval['\"]|script-src[^;\n]*['\"]unsafe-inline['\"]"
-            r"|trust\s+proxy['\"]?\s*,\s*true|trustedProxies\s*\(\s*at:\s*'\*')"
+            r"(?:['\"]unsafe-eval['\"]"
+            r"|(?:default-src|script-src|style-src)[^;\n]*['\"]unsafe-inline['\"]"
+            r"|trusted_proxy_cidrs\s*=\s*[\[(][^)\]]*['\"]\*['\"]"
+            r"|allowed_hosts\s*=\s*\[?\s*['\"]\*['\"]"
+            r"|allow_origins\s*=\s*\[?\s*['\"]\*['\"])"
         ),
         "scope": "src",
     },
     {
         "id": "SEC-LINT-005",
         "description": "Dynamic interpolation in raw SQL execution; use parameterized bindings",
-        "pattern": r"(?:\.queryRawUnsafe|\.execute\s*\(\s*f[\"'])",
+        "pattern": (
+            r"\.(?:execute|executemany|exec_driver_sql)\s*\(\s*"
+            r"(?:[rRfFbBuU]*[fF][\"']|[^)]*(?:\.format\s*\(|\s%\s|\s\+\s))"
+        ),
         "scope": "src",
     },
     {
         "id": "SEC-LINT-006",
         "description": "Disallow internal path leak in robots.txt (use positive Allow rules)",
         "pattern": r"Disallow:\s*/(?:admin|platform|internal|agency|portal|dashboard)",
-        "scope": "src",
+        "scope": "all",
     },
     {
         "id": "SEC-LINT-007",
         "description": "Tautological placeholder test assertion prohibited",
-        "pattern": r"(?:expect\(\s*true\s*\)\.toBe\(\s*true\s*\)|\bassert\s+True\b)",
+        "pattern": r"\bassert\s*\(?\s*(?:True|not\s+False|1\s*==\s*1)\b",
         "scope": "tests",
-    },
-    {
-        "id": "SEC-LINT-008",
-        "description": "Binary float prohibited in financial domain; use Fraction & minor ints",
-        "pattern": r"\bfloat\b",
-        "scope": "domain",
     },
 ]
 
-SQL_RLS_RULE_META: dict[str, str] = {
-    "id": "SEC-LINT-009",
-    "description": "SQL table declared without both ENABLE and FORCE ROW LEVEL SECURITY",
+AST_FLOAT_RULE_META: dict[str, str] = {
+    "id": "SEC-LINT-008",
+    "description": (
+        "Binary float literal, float(), or true-division `/` prohibited in domain/application"
+    ),
 }
 
-_SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*[\s\S]*?\*/")
+SQL_RLS_RULE_META: dict[str, str] = {
+    "id": "SEC-LINT-009",
+    "description": "SQL table declared without active ENABLE + FORCE ROW LEVEL SECURITY",
+}
+
 _CREATE_TABLE_RE = re.compile(
-    r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[a-zA-Z_][\w]*\.)?([a-zA-Z_][\w]*)\b",
+    r"\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+|FOREIGN\s+)?TABLE\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:\"[^\"]+\"|[a-zA-Z_][\w]*)\.)?"
+    r"(?:\"([^\"]+)\"|([a-zA-Z_][\w]*)\b)",
     re.IGNORECASE,
 )
 
 
-def strip_sql_comments_preserving_newlines(sql_text: str) -> str:
-    """Replace SQL comments with whitespace while keeping line numbers aligned."""
+def strip_sql_comments_and_strings(sql_text: str) -> str:
+    """Strip nested `/* ... */` / `-- ...` comments and `'...'` literals, preserving lines."""
+    out: list[str] = []
+    i = 0
+    n = len(sql_text)
+    block_depth = 0
 
-    def _blank(match: re.Match[str]) -> str:
-        raw = match.group(0)
-        return "".join("\n" if ch == "\n" else " " for ch in raw)
+    while i < n:
+        ch = sql_text[i]
+        nxt = sql_text[i + 1] if i + 1 < n else ""
 
-    return _SQL_COMMENT_RE.sub(_blank, sql_text)
+        if block_depth > 0:
+            if ch == "/" and nxt == "*":
+                block_depth += 1
+                out.extend((" ", " "))
+                i += 2
+            elif ch == "*" and nxt == "/":
+                block_depth -= 1
+                out.extend((" ", " "))
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            block_depth = 1
+            out.extend((" ", " "))
+            i += 2
+            continue
+
+        if ch == "-" and nxt == "-":
+            while i < n and sql_text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+
+        if ch == "'":
+            out.append("'")
+            i += 1
+            while i < n:
+                sc = sql_text[i]
+                if sc == "'" and i + 1 < n and sql_text[i + 1] == "'":
+                    out.extend((" ", " "))
+                    i += 2
+                    continue
+                if sc == "'":
+                    out.append("'")
+                    i += 1
+                    break
+                out.append("\n" if sc == "\n" else " ")
+                i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
-def scan_sql_rls_invariants(file_path: Path, rel_path: str, content: str) -> list[dict[str, Any]]:
-    """Verify every `CREATE TABLE` in `sql/*.sql` has ENABLE + FORCE ROW LEVEL SECURITY."""
-    del file_path
-    stripped = strip_sql_comments_preserving_newlines(content)
+def scan_sql_rls_invariants(rel_path: str, content: str) -> list[dict[str, Any]]:
+    """Verify every SQL table has ENABLE + FORCE RLS and is never weakened."""
+    stripped = strip_sql_comments_and_strings(content)
     violations: list[dict[str, Any]] = []
 
     for match in _CREATE_TABLE_RE.finditer(stripped):
-        table_name = match.group(1)
+        table_name = match.group(1) or match.group(2)
         line_no = stripped[: match.start()].count("\n") + 1
+        table_ref = rf"(?:(?:\"[^\"]+\"|[a-zA-Z_][\w]*)\.)?\"?{re.escape(table_name)}\"?"
+
         enable_re = re.compile(
-            rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
-            rf"(?:[a-zA-Z_][\w]*\.)?{re.escape(table_name)}\s+"
+            rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{table_ref}\s+"
             rf"ENABLE\s+ROW\s+LEVEL\s+SECURITY\b",
             re.IGNORECASE,
         )
         force_re = re.compile(
-            rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
-            rf"(?:[a-zA-Z_][\w]*\.)?{re.escape(table_name)}\s+"
+            rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{table_ref}\s+"
             rf"FORCE\s+ROW\s+LEVEL\s+SECURITY\b",
             re.IGNORECASE,
         )
-        has_enable = enable_re.search(stripped) is not None
-        has_force = force_re.search(stripped) is not None
-        if not (has_enable and has_force):
-            missing_parts: list[str] = []
-            if not has_enable:
-                missing_parts.append("ENABLE ROW LEVEL SECURITY")
-            if not has_force:
-                missing_parts.append("FORCE ROW LEVEL SECURITY")
+        weaken_re = re.compile(
+            rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{table_ref}\s+"
+            rf"(?:DISABLE|NO\s+FORCE)\s+ROW\s+LEVEL\s+SECURITY\b",
+            re.IGNORECASE,
+        )
+
+        missing_parts: list[str] = []
+        if enable_re.search(stripped) is None:
+            missing_parts.append("ENABLE ROW LEVEL SECURITY")
+        if force_re.search(stripped) is None:
+            missing_parts.append("FORCE ROW LEVEL SECURITY")
+        if weaken_re.search(stripped) is not None:
+            missing_parts.append("weakened by DISABLE/NO FORCE ROW LEVEL SECURITY")
+
+        if missing_parts:
             violations.append(
                 {
                     "id": SQL_RLS_RULE_META["id"],
                     "description": (
                         f"{SQL_RLS_RULE_META['description']} "
-                        f"(table '{table_name}' missing {', '.join(missing_parts)})"
+                        f"(table '{table_name}': {', '.join(missing_parts)})"
                     ),
                     "file": rel_path,
                     "line": line_no,
                     "snippet": match.group(0).strip()[:140],
+                }
+            )
+    return violations
+
+
+def scan_python_ast_invariants(rel_path: str, content: str) -> list[dict[str, Any]]:
+    """Enforce zero binary `float` literals, `float()`, or `/` division via Python AST."""
+    violations: list[dict[str, Any]] = []
+    try:
+        tree = ast.parse(content, filename=rel_path)
+    except SyntaxError:
+        return violations
+
+    for node in ast.walk(tree):
+        hit_snippet: str | None = None
+        if isinstance(node, ast.Constant) and isinstance(node.value, float):
+            hit_snippet = repr(node.value)
+        elif isinstance(node, ast.Name) and node.id == "float":
+            hit_snippet = "float"
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            hit_snippet = "true division (/)"
+
+        if hit_snippet is not None:
+            violations.append(
+                {
+                    "id": AST_FLOAT_RULE_META["id"],
+                    "description": AST_FLOAT_RULE_META["description"],
+                    "file": rel_path,
+                    "line": getattr(node, "lineno", 1),
+                    "snippet": hit_snippet,
                 }
             )
     return violations
@@ -203,32 +303,37 @@ def scan(root: Path) -> list[dict[str, Any]]:
         rel = file_path.relative_to(root).as_posix()
         is_test = rel.startswith("tests/") or ".test." in rel
         is_src = rel.startswith("src/")
-        is_domain = rel.startswith("src/ledger_guard/domain/")
-        is_sql = rel.startswith("sql/") and file_path.suffix == ".sql"
+        is_domain_or_app = rel.startswith("src/ledger_guard/domain/") or rel.startswith(
+            "src/ledger_guard/application/"
+        )
+        is_sql = file_path.suffix == ".sql"
         try:
             content = file_path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
 
         if is_sql:
-            violations.extend(scan_sql_rls_invariants(file_path, rel, content))
+            violations.extend(scan_sql_rls_invariants(rel, content))
 
+        if is_domain_or_app and file_path.suffix == ".py":
+            violations.extend(scan_python_ast_invariants(rel, content))
+
+        lines = content.splitlines()
         for rule, regex in compiled:
             scope = rule.get("scope", "src")
             if scope == "tests" and not is_test:
                 continue
-            if scope == "src" and not is_src:
-                continue
-            if scope == "domain" and not is_domain:
+            if scope == "src" and not (is_src and file_path.suffix == ".py"):
                 continue
 
             for match in regex.finditer(content):
-                marker = rule.get("allow_marker")
-                if marker:
-                    prev_lines = content[: match.start()].splitlines()[-15:]
-                    if any(marker in ln for ln in prev_lines):
-                        continue
                 line_no = content[: match.start()].count("\n") + 1
+                marker = rule.get("allow_marker")
+                if marker and 1 <= line_no <= len(lines):
+                    cur_line = lines[line_no - 1]
+                    prev_line = lines[line_no - 2] if line_no >= 2 else ""
+                    if marker in cur_line or marker in prev_line:
+                        continue
                 violations.append(
                     {
                         "id": rule["id"],
@@ -242,10 +347,16 @@ def scan(root: Path) -> list[dict[str, Any]]:
 
 
 def build_sarif_report(violations: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build a SARIF 2.1.0 report for GitHub Code Scanning / CI artifacts."""
+    """Build a SARIF 2.1.0 report for CI archiving and security scanning."""
     all_rules = [
         {"id": r["id"], "shortDescription": {"text": r["description"]}} for r in BANNED_RULES
     ]
+    all_rules.append(
+        {
+            "id": AST_FLOAT_RULE_META["id"],
+            "shortDescription": {"text": AST_FLOAT_RULE_META["description"]},
+        }
+    )
     all_rules.append(
         {
             "id": SQL_RLS_RULE_META["id"],
@@ -276,7 +387,7 @@ def build_sarif_report(violations: list[dict[str, Any]]) -> dict[str, Any]:
                 "tool": {
                     "driver": {
                         "name": "ledger-guard-security-lint",
-                        "version": "0.2.0",
+                        "version": "0.3.0",
                         "rules": all_rules,
                     }
                 },
@@ -287,36 +398,38 @@ def build_sarif_report(violations: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def run_self_test() -> int:
-    """Verify all 9 lint rules catch negative fixtures while passing clean code."""
+    """Verify all 9 lint rules catch adversarial fixtures while passing the clean repo."""
     with tempfile.TemporaryDirectory(prefix="lg-lint-selftest-") as tmp_dir:
         tmp_root = Path(tmp_dir)
         (tmp_root / "src" / "ledger_guard" / "domain").mkdir(parents=True)
+        (tmp_root / "src" / "ledger_guard" / "application").mkdir(parents=True)
         (tmp_root / "tests").mkdir(parents=True)
         (tmp_root / "sql").mkdir(parents=True)
 
         bad_src = "\n".join(
             [
-                "dsn = DATABASE_MIGRATOR_URL",
-                "session['current_tenant_id'] = request.body('tenant_id')",
-                "flag = user.is_active or True",
-                "csp = \"script-src 'self' 'unsafe-inline'\"",
-                'cur.execute(f"SELECT * FROM orders WHERE id = {oid}")',
-                'robots = "Disallow: /admin"',
+                'role_name = "app_migrator"',
+                "current_tenant_id = request.headers.get('X-Tenant')",
+                'active = payload.get("is_active", True)',
+                "csp = \"style-src 'self' 'unsafe-inline'\"",
+                'cur.execute(rf"SELECT * FROM orders WHERE id = {oid}")',
             ]
         )
         (tmp_root / "src" / "bad_runtime.py").write_text(bad_src, encoding="utf-8")
+        (tmp_root / "robots.txt").write_text("Disallow: /admin\n", encoding="utf-8")
         (tmp_root / "src" / "ledger_guard" / "domain" / "bad_math.py").write_text(
-            "x = float(10)\n",
+            "price_ratio = 1.5\nhalf = 1 / 2\n",
             encoding="utf-8",
         )
         (tmp_root / "tests" / "test_bad.py").write_text(
-            "def test_placeholder():\n    assert True\n",
+            "def test_placeholder():\n    assert(True)\n",
             encoding="utf-8",
         )
         (tmp_root / "sql" / "001_bad.sql").write_text(
-            "-- ALTER TABLE naked_orders FORCE ROW LEVEL SECURITY;\n"
-            "CREATE TABLE naked_orders (id UUID PRIMARY KEY, tenant_id UUID NOT NULL);\n"
-            "ALTER TABLE naked_orders ENABLE ROW LEVEL SECURITY;\n",
+            "/* outer /* inner */ ALTER TABLE \"naked_orders\" FORCE ROW LEVEL SECURITY; */\n"
+            'CREATE UNLOGGED TABLE "naked_orders" (id UUID PRIMARY KEY, tenant_id UUID NOT NULL);\n'
+            'ALTER TABLE "naked_orders" ENABLE ROW LEVEL SECURITY;\n'
+            "SELECT 'ALTER TABLE \"naked_orders\" FORCE ROW LEVEL SECURITY';\n",
             encoding="utf-8",
         )
 
@@ -330,10 +443,12 @@ def run_self_test() -> int:
 
     repo_violations = scan(ROOT)
     if repo_violations:
-        print(f"SELF-TEST FAIL: Repository has {len(repo_violations)} active violation(s).")
+        print(f"SELF-TEST FAIL: Repository has {len(repo_violations)} active violation(s):")
+        for item in repo_violations:
+            print(f"  [{item['id']}] {item['file']}:{item['line']} - {item['snippet']}")
         return 1
 
-    print("SELF-TEST PASS: All 9 security/financial lint rules verified (negative + repo clean).")
+    print("SELF-TEST PASS: All 9 security/AST/SQL lint rules verified (negative + repo clean).")
     return 0
 
 

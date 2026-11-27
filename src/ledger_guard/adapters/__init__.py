@@ -11,11 +11,7 @@ from ledger_guard.adapters.in_memory import (
     InMemoryValuationAdapter,
     InMemoryWebhookDedupStore,
 )
-from ledger_guard.adapters.postgres_rls import (
-    PostgresTenantSession,
-    SqlConnectionProtocol,
-    SqlCursorProtocol,
-)
+from ledger_guard.adapters.postgres_rls import PostgresTenantSession
 
 __all__ = [
     "InMemoryAuditOutbox",
@@ -26,6 +22,4 @@ __all__ = [
     "InMemoryValuationAdapter",
     "InMemoryWebhookDedupStore",
     "PostgresTenantSession",
-    "SqlConnectionProtocol",
-    "SqlCursorProtocol",
 ]
