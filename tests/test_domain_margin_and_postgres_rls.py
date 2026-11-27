@@ -316,22 +316,25 @@ def test_optimistic_concurrency_conflict_raises_409_conflict_error(world: Seeded
 
 
 class _FakeSqlCursor:
-    def __init__(self, *, membership_exists: bool) -> None:
+    def __init__(self, *, membership_exists: bool, fail_rollback: bool = False) -> None:
         self.membership_exists = membership_exists
+        self.fail_rollback = fail_rollback
         self.executed: list[tuple[str, Sequence[Any] | None]] = []
         self.closed = False
 
     def execute(self, query: str, params: Sequence[Any] | None = None) -> None:
+        if query == "ROLLBACK" and self.fail_rollback:
+            raise OSError("Simulated dropped socket during rollback")
         self.executed.append((query, params))
 
     def fetchone(self) -> tuple[Any, ...] | None:
         if self.membership_exists:
-            return (1,)
+            return ("sales_rep",)
         return None
 
     def fetchall(self) -> Sequence[tuple[Any, ...]]:
         if self.membership_exists:
-            return [(1,)]
+            return [("sales_rep",)]
         return []
 
     def close(self) -> None:
@@ -339,12 +342,16 @@ class _FakeSqlCursor:
 
 
 class _FakeSqlConnection:
-    def __init__(self, *, membership_exists: bool = True) -> None:
+    def __init__(self, *, membership_exists: bool = True, fail_rollback: bool = False) -> None:
         self.membership_exists = membership_exists
+        self.fail_rollback = fail_rollback
         self.cursors: list[_FakeSqlCursor] = []
 
     def cursor(self) -> _FakeSqlCursor:
-        cur = _FakeSqlCursor(membership_exists=self.membership_exists)
+        cur = _FakeSqlCursor(
+            membership_exists=self.membership_exists,
+            fail_rollback=self.fail_rollback,
+        )
         self.cursors.append(cur)
         return cur
 
@@ -364,9 +371,11 @@ def test_postgres_tenant_session_two_stage_rls_and_clean_exit_guard() -> None:
     queries = [q for q, _ in conn.cursors[0].executed]
     assert queries[0] == "BEGIN"
     assert "app.current_user_id" in queries[1]
+    assert "app.stage_a_tenant_id" in queries[1]
     assert "FROM tenant_memberships" in queries[2]
     assert "app.current_tenant_id" in queries[3]
-    assert "pg_advisory_xact_lock" in queries[4]
+    assert "app.current_role" in queries[3]
+    assert "acquire_tenant_lock" in queries[4]
     assert queries[5] == "COMMIT"
 
 
@@ -386,9 +395,7 @@ def test_postgres_tenant_session_rolls_back_and_rejects_missing_membership() -> 
     assert not any("app.current_tenant_id" in q for q in queries)
 
 
-def test_postgres_tenant_session_blocks_nested_cross_tenant_escalation_and_non_runtime_role() -> (
-    None
-):
+def test_postgres_tenant_session_blocks_nested_escalation_and_poisoned_rollback() -> None:
     conn = _FakeSqlConnection(membership_exists=True)
     with pytest.raises(AuthorizationError):
         PostgresTenantSession(conn, runtime_role="postgres")
@@ -403,7 +410,136 @@ def test_postgres_tenant_session_blocks_nested_cross_tenant_escalation_and_non_r
             session.scoped_transaction(principal_id="rep@alpha.example", tenant_id=other_tenant),
         ):
             pass
+        with (
+            pytest.raises(AuthorizationError) as principal_exc,
+            session.scoped_transaction(
+                principal_id="other.rep@alpha.example", tenant_id=TENANT_ALPHA
+            ),
+        ):
+            pass
+        assert principal_exc.value.code == "PRINCIPAL_SCOPE_ESCALATION"
     session.assert_clean_boundary()
+
+    poison_conn = _FakeSqlConnection(membership_exists=True, fail_rollback=True)
+    poisoned_session = PostgresTenantSession(poison_conn)
+    with (
+        pytest.raises(ValueError, match="primary domain failure"),
+        poisoned_session.scoped_transaction(
+            principal_id="rep@alpha.example", tenant_id=TENANT_ALPHA
+        ),
+    ):
+        raise ValueError("primary domain failure")
+    with pytest.raises(RuntimeError, match="TENANT-ABUSE-02"):
+        poisoned_session.assert_clean_boundary()
+
+
+def test_sticky_tier_discount_clears_and_four_eyes_blocks_amender_washing_and_exposure_growth(
+    world: SeededWorld,
+) -> None:
+    rep_one = world.container.memberships.resolve_active_principal(
+        TENANT_ALPHA, "rep.one@alpha.example"
+    )
+    approver = world.container.memberships.resolve_active_principal(
+        TENANT_ALPHA, "controller@alpha.example"
+    )
+    second_approver = PrincipalContext(
+        principal_id="cfo@alpha.example",
+        tenant_id=TENANT_ALPHA,
+        role="finance_approver",
+        capabilities=frozenset({"orders:margin:approve", "orders:read", "orders:write"}),
+        is_active=True,
+    )
+
+    # 1. Sticky tier discount (DOM-04): 10 units triggers 500 bps; dropping to 1 resets to 0
+    bulk_order = world.container.order_service.create_order(
+        rep_one,
+        customer_ref="TIER-REVERT-01",
+        order_kind=OrderKind.STANDARD,
+        currency=Currency.GBP,
+        lines=[OrderLineCommand(sku="VALVE-DN50", quantity=10, unit_price_minor=10_000)],
+    )
+    assert bulk_order["lines"][0]["applied_discount_bps"] == 500
+    reduced = world.container.order_service.amend_order_line(
+        rep_one,
+        order_id=UUID(bulk_order["order_id"]),
+        line_id=UUID(bulk_order["lines"][0]["line_id"]),
+        expected_version=1,
+        quantity=1,
+    )
+    assert reduced["lines"][0]["applied_discount_bps"] == 0
+    assert reduced["header_steps"][0]["kind"] == "PASSTHROUGH_FREIGHT"
+
+    # Empty no-op amendment is rejected (EMPTY_AMENDMENT)
+    with pytest.raises(ValidationError) as noop_exc:
+        world.container.order_service.amend_order_line(
+            rep_one,
+            order_id=UUID(bulk_order["order_id"]),
+            line_id=UUID(bulk_order["lines"][0]["line_id"]),
+            expected_version=2,
+        )
+    assert noop_exc.value.code == "EMPTY_AMENDMENT"
+
+    # 2. Amender-washing blocked (DOM-05): approver amends price, rep amends qty up,
+    #    approver MUST remain permanently blocked via amended_by_history
+    order = world.container.order_service.create_order(
+        rep_one,
+        customer_ref="WASH-ATTEMPT-01",
+        order_kind=OrderKind.STANDARD,
+        currency=Currency.GBP,
+        lines=[OrderLineCommand(sku="VALVE-DN50", quantity=1, unit_price_minor=10_000)],
+    )
+    oid = UUID(order["order_id"])
+    lid = UUID(order["lines"][0]["line_id"])
+
+    world.container.order_service.amend_order_line(
+        approver,
+        order_id=oid,
+        line_id=lid,
+        expected_version=1,
+        unit_price_minor=6_000,
+    )
+    world.container.order_service.amend_order_line(
+        rep_one,
+        order_id=oid,
+        line_id=lid,
+        expected_version=2,
+        unit_price_minor=6_100,
+    )
+    with pytest.raises(SeparationOfDutiesError):
+        world.container.order_service.approve_margin(
+            approver,
+            order_id=oid,
+            expected_version=3,
+            reason="Controller washed last_amended_by via rep amendment",
+        )
+
+    # 3. 10,000x sub-floor exposure amplification invalidates prior approval (DOM-05)
+    approved = world.container.order_service.approve_margin(
+        second_approver,
+        order_id=oid,
+        expected_version=3,
+        reason="One-unit trial loss exception only",
+    )
+    assert approved["approvals"][0]["approved_net_goods_minor"] == 6_100
+    confirmed = world.container.order_service.confirm_order(
+        rep_one, order_id=oid, expected_version=4
+    )
+    assert confirmed["status"] == "confirmed"
+
+    with pytest.raises(ConflictError) as reconfirm_exc:
+        world.container.order_service.confirm_order(rep_one, order_id=oid, expected_version=5)
+    assert reconfirm_exc.value.code == "ORDER_ALREADY_CONFIRMED"
+
+    amplified = world.container.order_service.amend_order_line(
+        rep_one,
+        order_id=oid,
+        line_id=lid,
+        expected_version=5,
+        quantity=100,
+    )
+    assert amplified["status"] == "pending_approval"
+    assert amplified["readiness_gates"][0]["code"] == "MARGIN_BELOW_FLOOR_BLOCK"
+    assert amplified["pricing_version"] == 4
 
 
 def test_sql_migration_enforces_enable_and_force_rls_on_every_table() -> None:

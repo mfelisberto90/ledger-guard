@@ -10,12 +10,13 @@ dist/
 build/
 *.egg-info/
 
-# Type checking, linting & test caches
+# Type checking, linting, SARIF & test caches
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+results.sarif
 
 # Local environment secrets (never commit)
 .env

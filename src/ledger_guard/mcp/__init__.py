@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from ledger_guard.mcp.server import MCP_TOOLS_SPEC, McpToolServer
+from ledger_guard.mcp.server import McpToolServer
 
-__all__ = ["MCP_TOOLS_SPEC", "McpToolServer"]
+__all__ = ["McpToolServer"]

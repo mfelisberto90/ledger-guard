@@ -74,6 +74,13 @@ class ConflictError(DomainError):
     http_status = 409
 
 
+class PayloadTooLargeError(DomainError):
+    """Raised when an HTTP request body exceeds configured byte limits."""
+
+    code = "PAYLOAD_TOO_LARGE"
+    http_status = 413
+
+
 class MarginBlockedError(DomainError):
     """Raised when order confirmation is blocked by an unmet margin readiness gate."""
 
@@ -95,13 +102,6 @@ class RateLimitExceededError(DomainError):
         )
         self.retry_after_seconds = retry_after_seconds
         self.bucket = bucket
-
-
-class ScannerBannedError(AuthorizationError):
-    """Raised when an unauthenticated scanner or canary trap IP is temporarily banned."""
-
-    code = "SCANNER_IP_BANNED"
-    http_status = 403
 
 
 class WebhookVerificationError(AuthenticationError):

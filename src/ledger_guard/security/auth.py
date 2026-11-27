@@ -1,4 +1,4 @@
-"""Authentication, scrypt password hashing, HMAC bearer tokens, and cookie hygiene."""
+"""Authentication, scrypt password hashing, and HMAC bearer tokens."""
 
 from __future__ import annotations
 
@@ -17,6 +17,12 @@ from uuid import UUID
 from ledger_guard.domain.errors import AuthenticationError, AuthorizationError, ValidationError
 from ledger_guard.domain.margin_gate import PrincipalContext, normalize_principal_id
 from ledger_guard.domain.money import require_strict_int, validate_safe_text
+from ledger_guard.security.rate_limit import BoundedMap
+
+MAX_TOKEN_LENGTH: int = 4_096
+MAX_TOKEN_TTL_SECONDS: int = 86_400
+MAX_CLOCK_SKEW_SECONDS: int = 60
+_SCRYPT_MAXMEM: int = 67_108_864
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -32,12 +38,13 @@ def _b64url_decode(encoded: str) -> bytes:
 
 
 class PasswordHasher:
-    """Memory-hard `scrypt` password/PIN hasher with constant-time `compare_digest`."""
+    """Memory-hard `scrypt` password/PIN hasher with constant-time timing hygiene."""
 
     def __init__(self, *, n: int = 16_384, r: int = 8, p: int = 1) -> None:
         self._n = n
         self._r = r
         self._p = p
+        self._dummy_hash = self.hash_password("LedgerGuardDummyConstantTimeCheck!0")
 
     def hash_password(self, plain_password: str) -> str:
         if len(plain_password) < 8 or len(plain_password) > 256:
@@ -50,11 +57,17 @@ class PasswordHasher:
             r=self._r,
             p=self._p,
             dklen=32,
+            maxmem=_SCRYPT_MAXMEM,
         )
         return (
             f"scrypt${self._n}${self._r}${self._p}$"
             f"{_b64url_encode(salt)}${_b64url_encode(derived)}"
         )
+
+    def verify_dummy(self, plain_password: str) -> bool:
+        """Burn constant `scrypt` verification time when a login account does not exist."""
+        self.verify_password(plain_password or "dummy-padding-check", self._dummy_hash)
+        return False
 
     def verify_password(self, plain_password: str, encoded_hash: str) -> bool:
         if not plain_password or len(plain_password) > 256:
@@ -66,18 +79,31 @@ class PasswordHasher:
             n_val = int(parts[1])
             r_val = int(parts[2])
             p_val = int(parts[3])
+            if (
+                n_val < 4_096
+                or n_val > 65_536
+                or (n_val & (n_val - 1)) != 0
+                or r_val < 1
+                or r_val > 16
+                or p_val < 1
+                or p_val > 4
+            ):
+                return False
             salt = _b64url_decode(parts[4])
             expected = _b64url_decode(parts[5])
-        except (ValueError, AuthenticationError):
+            if len(salt) != 16 or len(expected) != 32:
+                return False
+            candidate = hashlib.scrypt(
+                plain_password.encode("utf-8"),
+                salt=salt,
+                n=n_val,
+                r=r_val,
+                p=p_val,
+                dklen=32,
+                maxmem=_SCRYPT_MAXMEM,
+            )
+        except (ValueError, MemoryError, AuthenticationError):
             return False
-        candidate = hashlib.scrypt(
-            plain_password.encode("utf-8"),
-            salt=salt,
-            n=n_val,
-            r=r_val,
-            p=p_val,
-            dklen=len(expected),
-        )
         return hmac.compare_digest(candidate, expected)
 
 
@@ -89,17 +115,29 @@ class VerifiedTokenClaims:
     tenant_id: UUID
     issued_at: int
     expires_at: int
+    jti: str
     scoped_capabilities: frozenset[str] | None = None
 
 
 class TokenService:
-    """HMAC-SHA256 stateless token signer/verifier (`lg1.<claims>.<sig>`)."""
+    """HMAC-SHA256 stateless token signer/verifier with `jti` revocation (`lg1.<claims>.<sig>`)."""
 
-    def __init__(self, signing_key: bytes, *, default_ttl_seconds: int = 3_600) -> None:
+    def __init__(
+        self,
+        signing_key: bytes,
+        *,
+        default_ttl_seconds: int = 3_600,
+        max_revoked_jtis: int = 10_000,
+    ) -> None:
         if len(signing_key) < 32:
             raise ValidationError("Token signing key must be at least 32 bytes.")
         self._key = signing_key
         self._default_ttl = default_ttl_seconds
+        self._revoked_jtis: BoundedMap[str, int] = BoundedMap(max_entries=max_revoked_jtis)
+
+    def revoke_jti(self, jti: str, expires_at: int = 0) -> None:
+        clean_jti = validate_safe_text(jti, "jti", max_length=64)
+        self._revoked_jtis.set(clean_jti, expires_at)
 
     def issue_token(
         self,
@@ -116,14 +154,17 @@ class TokenService:
             if ttl_seconds is None
             else require_strict_int(ttl_seconds, "ttl_seconds")
         )
-        if ttl <= 0:
-            raise ValidationError("Token ttl_seconds must be positive.")
+        if ttl <= 0 or ttl > MAX_TOKEN_TTL_SECONDS:
+            raise ValidationError(
+                f"Token ttl_seconds must be between 1 and {MAX_TOKEN_TTL_SECONDS}."
+            )
 
         payload: dict[str, Any] = {
             "sub": normalize_principal_id(principal_id),
             "tid": str(tenant_id),
             "iat": now,
             "exp": now + ttl,
+            "jti": secrets.token_hex(8),
         }
         if scoped_capabilities is not None:
             normalized_scp = sorted(
@@ -144,7 +185,10 @@ class TokenService:
         return f"lg1.{encoded_payload}.{_b64url_encode(sig)}"
 
     def verify_token(self, token: str, *, now_epoch: int | None = None) -> VerifiedTokenClaims:
-        parts = token.strip().split(".")
+        stripped = token.strip()
+        if not stripped or len(stripped) > MAX_TOKEN_LENGTH:
+            raise AuthenticationError("Unrecognised or oversized bearer token.")
+        parts = stripped.split(".")
         if len(parts) != 3 or parts[0] != "lg1":
             raise AuthenticationError("Unrecognised bearer token format.")
         encoded_payload, encoded_sig = parts[1], parts[2]
@@ -158,11 +202,21 @@ class TokenService:
             raise AuthenticationError("Bearer token signature verification failed.")
 
         try:
-            raw_obj: dict[str, Any] = json.loads(_b64url_decode(encoded_payload).decode("utf-8"))
-            sub = str(raw_obj["sub"])
+            raw_obj = json.loads(_b64url_decode(encoded_payload).decode("utf-8"))
+            if not isinstance(raw_obj, dict):
+                raise ValueError("Token payload must be an object.")
+            sub = normalize_principal_id(str(raw_obj["sub"]))
             tid = UUID(str(raw_obj["tid"]))
-            iat = int(raw_obj["iat"])
-            exp = int(raw_obj["exp"])
+            raw_iat = raw_obj["iat"]
+            raw_exp = raw_obj["exp"]
+            if (
+                isinstance(raw_iat, bool)
+                or isinstance(raw_exp, bool)
+                or not isinstance(raw_iat, int)
+                or not isinstance(raw_exp, int)
+            ):
+                raise ValueError("Token iat/exp must be strict integers.")
+            jti = str(raw_obj.get("jti", ""))
             parsed_scp: frozenset[str] | None = None
             if "scp" in raw_obj:
                 raw_scp = raw_obj["scp"]
@@ -178,14 +232,21 @@ class TokenService:
             raise AuthenticationError("Invalid bearer token claims payload.") from exc
 
         now = int(time.time()) if now_epoch is None else now_epoch
-        if now >= exp:
+        if raw_exp <= raw_iat or (raw_exp - raw_iat) > MAX_TOKEN_TTL_SECONDS:
+            raise AuthenticationError("Invalid bearer token lifetime window.")
+        if raw_iat > now + MAX_CLOCK_SKEW_SECONDS:
+            raise AuthenticationError("Bearer token issued in the future.")
+        if now >= raw_exp:
             raise AuthenticationError("Bearer token has expired.", code="TOKEN_EXPIRED")
+        if jti and self._revoked_jtis.get(jti) is not None:
+            raise AuthenticationError("Bearer token has been revoked.", code="TOKEN_REVOKED")
 
         return VerifiedTokenClaims(
-            principal_id=normalize_principal_id(sub),
+            principal_id=sub,
             tenant_id=tid,
-            issued_at=iat,
-            expires_at=exp,
+            issued_at=raw_iat,
+            expires_at=raw_exp,
+            jti=jti,
             scoped_capabilities=parsed_scp,
         )
 
@@ -255,22 +316,3 @@ class MembershipDirectory:
         normalized = normalize_principal_id(principal_id)
         with self._lock:
             return self._records.get((tenant_id, normalized))
-
-
-def build_session_cookie_flags(
-    *,
-    is_dev: bool,
-    request_is_secure: bool,
-    x_forwarded_proto: str | None = None,
-    force_secure_cookies: bool = False,
-) -> dict[str, Any]:
-    """Derive fail-safe cookie flags preserving local HTTP tests while enforcing HTTPS in prod."""
-    forwarded_https = (x_forwarded_proto or "").strip().lower() == "https"
-    secure_flag = (not is_dev) and (
-        request_is_secure or forwarded_https or force_secure_cookies
-    )
-    return {
-        "httponly": True,
-        "samesite": "lax",
-        "secure": secure_flag,
-    }

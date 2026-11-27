@@ -1,20 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.github.mfelisberto90/ledger-guard",
+  "title": "LedgerGuard",
   "description": "Governed B2B order pricing, exact Fraction UoM margin gates, and capability-projected MCP tools.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "repository": {
     "url": "https://github.com/mfelisberto90/ledger-guard",
     "source": "github"
   },
-  "packages": [
-    {
-      "registryType": "pypi",
-      "identifier": "ledger-guard",
-      "version": "0.2.0",
-      "transport": {
-        "type": "stdio"
-      }
-    }
-  ]
+  "websiteUrl": "https://github.com/mfelisberto90/ledger-guard"
 }

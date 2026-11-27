@@ -6,17 +6,21 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   quality-and-security:
     name: Python 3.12, Security Lint, MCP stdio & PostgreSQL 17 FORCE RLS
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres_ci_ephemeral
@@ -30,10 +34,12 @@ jobs:
           --health-retries 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install uv and Python 3.12
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
           enable-cache: true
@@ -47,13 +53,24 @@ jobs:
       - name: Mypy strict static typing
         run: uv run mypy --strict src
 
-      - name: Architectural & SQL RLS invariant linter (self-test + SARIF)
+      - name: Architectural, AST float & SQL RLS invariant linter (self-test + SARIF)
         run: |
           uv run python3 scripts/security-lint.py --self-test
           uv run python3 scripts/security-lint.py --sarif results.sarif
 
-      - name: Dependency CVE audit (pip-audit)
-        run: uv run pip-audit
+      - name: Archive SARIF security lint artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-lint-sarif
+          path: results.sarif
+          retention-days: 14
+
+      - name: Strict dependency CVE audit (pip-audit)
+        run: |
+          uv export --frozen --no-hashes --no-emit-project --all-groups -o /tmp/lg-reqs.txt
+          uv run pip-audit --strict --no-deps -r /tmp/lg-reqs.txt
+          rm -f /tmp/lg-reqs.txt
 
       - name: Native MCP stdio server handshake check
         run: |

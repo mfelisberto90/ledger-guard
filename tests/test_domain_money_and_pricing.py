@@ -14,14 +14,19 @@ from ledger_guard.domain import (
     CurrencyMismatchError,
     ItemKind,
     LinePricingInput,
-    MinorAmount,
     QuantityTierDiscount,
     UnitRatio,
     ValidationError,
-    parse_rational_quantity,
     price_order_waterfall,
     round_rational_half_even,
 )
+from ledger_guard.domain.money import (
+    MAX_LINE_QUANTITY,
+    MAX_MINOR_AMOUNT,
+    parse_rational_quantity,
+    require_bounded_minor_int,
+)
+from ledger_guard.domain.pricing import compute_margin_bps
 
 
 def test_round_rational_half_even_bankers_ties() -> None:
@@ -33,33 +38,17 @@ def test_round_rational_half_even_bankers_ties() -> None:
     assert round_rational_half_even(Fraction(200, 3)) == 67
 
 
-def test_minor_amount_rejects_boolean_and_non_integer() -> None:
-    with pytest.raises(ValidationError):
-        MinorAmount(True, Currency.GBP)
-    with pytest.raises(ValidationError):
-        MinorAmount(12.5, Currency.GBP)  # type: ignore[arg-type]
+def test_require_bounded_minor_int_rejects_booleans_and_bigint_overflow() -> None:
+    with pytest.raises(ValidationError) as bool_exc:
+        require_bounded_minor_int(True, "unit_price_minor")
+    assert bool_exc.value.code == "NON_INTEGER_AMOUNT"
 
-
-def test_minor_amount_addition_and_subtraction_same_currency() -> None:
-    a = MinorAmount(1_250, Currency.GBP)
-    b = MinorAmount(750, Currency.GBP)
-    assert (a + b).amount_minor == 2_000
-    assert (a - b).amount_minor == 500
-    assert MinorAmount.zero(Currency.JPY).currency.minor_exponent == 0
-    assert Currency.GBP.minor_exponent == 2
-
-
-def test_minor_amount_rejects_cross_currency_without_fx() -> None:
-    gbp = MinorAmount(1_000, Currency.GBP)
-    eur = MinorAmount(1_000, Currency.EUR)
-    with pytest.raises(CurrencyMismatchError):
-        _ = gbp + eur
-    with pytest.raises(CurrencyMismatchError):
-        _ = gbp - eur
+    with pytest.raises(ValidationError) as overflow_exc:
+        require_bounded_minor_int(MAX_MINOR_AMOUNT + 1, "unit_price_minor")
+    assert overflow_exc.value.code == "AMOUNT_OUT_OF_BOUNDS"
 
 
 def test_unit_ratio_non_terminating_one_third_preserves_exact_case_cost() -> None:
-    # A 3-pack case costs £10.00 (1000p); selling 3 single bottles (1/3 case each) must equal 1000p
     ratio = UnitRatio(1, 3)
     snapshot = CostSnapshot(
         sku="REAGENT-BTL",
@@ -91,23 +80,60 @@ def test_unit_ratio_non_terminating_one_third_preserves_exact_case_cost() -> Non
     assert waterfall.margin_bps == 3_333
 
 
-def test_unit_ratio_rejects_zero_or_negative_components() -> None:
+def test_unit_ratio_rejects_zero_negative_or_unbounded_components() -> None:
     with pytest.raises(ValidationError):
         UnitRatio(0, 3)
     with pytest.raises(ValidationError):
         UnitRatio(1, -2)
-    assert UnitRatio(12, 1).to_base_quantity(Fraction(5, 2)) == Fraction(30, 1)
+    with pytest.raises(ValidationError):
+        UnitRatio(MAX_LINE_QUANTITY + 1, 1)
 
 
-def test_parse_rational_quantity_accepts_fraction_strings_and_rejects_zero_or_float() -> None:
+def test_parse_rational_quantity_blocks_scientific_notation_poison_pills_and_unicode() -> None:
     assert parse_rational_quantity("7/3") == Fraction(7, 3)
     assert parse_rational_quantity(4) == Fraction(4, 1)
-    with pytest.raises(ValidationError):
-        parse_rational_quantity(0)
-    with pytest.raises(ValidationError):
-        parse_rational_quantity("-3/2")
-    with pytest.raises(ValidationError):
-        parse_rational_quantity(1.5)  # type: ignore[arg-type]
+
+    for malicious in (
+        0,
+        -1,
+        "-3/2",
+        "1e5000",
+        "1e99999999",
+        "1e9999999999999999999999999",
+        "1/" + "9" * 20,
+        "1_000/3",
+        "١٢٣/٤",
+        1.5,
+        Fraction(1, 2_000_000),
+        MAX_LINE_QUANTITY + 1,
+    ):
+        with pytest.raises(ValidationError):
+            parse_rational_quantity(malicious)  # type: ignore[arg-type]
+
+
+def test_zero_rounded_paid_line_and_clamped_negative_margin_bps() -> None:
+    snap = CostSnapshot("MICRO-1", 50, Currency.GBP, UnitRatio(1, 1), 1)
+    with pytest.raises(ValidationError) as exc_info:
+        price_order_waterfall(
+            currency=Currency.GBP,
+            lines=[
+                LinePricingInput(
+                    line_id=uuid4(),
+                    sku="MICRO-1",
+                    description="Micro fractional line",
+                    item_kind=ItemKind.STOCKED,
+                    currency=Currency.GBP,
+                    quantity=Fraction(1, 10),
+                    unit_price_minor=1,
+                    unit_ratio=UnitRatio(1, 1),
+                    cost_snapshot=snap,
+                )
+            ],
+        )
+    assert exc_info.value.code == "ZERO_ROUNDED_LINE_GROSS"
+
+    # Low positive net_goods with higher cost clamps to -10_000 bps (matches SQL CHECK)
+    assert compute_margin_bps(-6_000, 1_000, 7_000) == -10_000
 
 
 def test_header_discount_spread_allocates_penny_remainders_without_drift() -> None:
@@ -134,9 +160,6 @@ def test_header_discount_spread_allocates_penny_remainders_without_drift() -> No
 
 
 def test_passthrough_freight_and_surcharge_excluded_from_margin_basis() -> None:
-    # Goods sold for £100.00, costing £85.00 -> 15.00% (1500 bps) margin.
-    # Adding £500.00 pass-through freight and £25.00 small-order surcharge raises payable total
-    # to £625.00, yet margin_minor MUST stay £15.00 (1500 bps), never inflated by freight!
     snap = CostSnapshot("PUMP-1", 8_500, Currency.GBP, UnitRatio(1, 1), 1)
     wf = price_order_waterfall(
         currency=Currency.GBP,

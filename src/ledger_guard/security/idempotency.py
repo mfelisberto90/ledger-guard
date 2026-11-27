@@ -34,14 +34,22 @@ def validate_idempotency_key(raw_key: str | None) -> str:
 
 
 def canonical_payload_sha256(payload: Mapping[str, Any]) -> str:
-    """Compute a deterministic key-sorted JSON SHA-256 digest."""
-    canonical_json = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    """Compute a deterministic strict JSON SHA-256 digest (rejecting NaN/surrogates)."""
+    try:
+        canonical_json = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        encoded = canonical_json.encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValidationError(
+            "Request payload contains non-JSON values unsuitable for idempotency hashing.",
+            code="INVALID_IDEMPOTENCY_PAYLOAD",
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +62,7 @@ class IdempotencyOutcome:
 
 
 class IdempotencyCoordinator:
-    """Scopes every idempotency record to `(tenant_id, principal_id, action, key)`."""
+    """Scopes every idempotency record unambiguously to `(tenant_id, principal_id, action, key)`."""
 
     def __init__(self, store: IdempotencyPort) -> None:
         self._store = store
@@ -69,7 +77,11 @@ class IdempotencyCoordinator:
     ) -> str:
         clean_key = validate_idempotency_key(idempotency_key)
         norm_principal = normalize_principal_id(principal_id)
-        return f"idempotency:{tenant_id}:{norm_principal}:{action}:{clean_key}"
+        return json.dumps(
+            ["idempotency", str(tenant_id), norm_principal, action.strip(), clean_key],
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
 
     def execute(
         self,

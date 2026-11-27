@@ -5,6 +5,9 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from fastapi.testclient import TestClient
+
+from ledger_guard.api.app import create_app
 from ledger_guard.security import compute_webhook_signature
 from tests.conftest import TENANT_ALPHA, SeededWorld
 
@@ -65,7 +68,7 @@ def test_cgnat_safe_honeypot_bans_unauthenticated_scanner_while_exempting_authen
     # Legitimate authenticated customer on the EXACT SAME CGNAT IP works uninterrupted!
     auth_cgnat = {
         "X-Forwarded-For": "198.51.100.200",
-        **_auth(world.sales_rep_token, "idem-cgnat-order-1"),
+        **_auth(world.sales_rep_token, "idem-order-1111"),
     }
     ok_resp = world.client.post(
         "/v1/orders",
@@ -90,7 +93,14 @@ def test_offensive_scanner_user_agent_is_banned_while_webhooks_remain_exempt(
     # Signed webhook from that IP still reaches webhook verification cleanly
     raw_body = b'{"type":"invoice.paid"}'
     ts = str(int(time.time()))
-    sig = compute_webhook_signature(world.container.webhook_secret, ts, raw_body)
+    sig = compute_webhook_signature(
+        world.container.webhook_secret,
+        ts,
+        raw_body,
+        provider="billing",
+        tenant_id=TENANT_ALPHA,
+        event_id="evt_live_901",
+    )
     wh_resp = world.client.post(
         "/v1/webhooks/billing",
         content=raw_body,
@@ -144,7 +154,7 @@ def test_bfla_missing_capabilities_return_403_forbidden(world: SeededWorld) -> N
     # Sales rep creates sub-floor order, then tries to call approve-margin without capability
     sub_floor = world.client.post(
         "/v1/orders",
-        headers=_auth(world.sales_rep_token, "idem-rep-subfloor-01"),
+        headers=_auth(world.sales_rep_token, "idem-order-2222"),
         json={
             "customer_ref": "SUBFLOOR-BFLA",
             "currency": "GBP",
@@ -153,7 +163,7 @@ def test_bfla_missing_capabilities_return_403_forbidden(world: SeededWorld) -> N
     ).json()
     approve_attempt = world.client.post(
         f"/v1/orders/{sub_floor['order_id']}/approve-margin",
-        headers=_auth(world.second_sales_rep_token, "idem-bfla-approve-01"),
+        headers=_auth(world.second_sales_rep_token, "idem-order-3333"),
         json={"expected_version": 1, "reason": "Unauthorized approval attempt"},
     )
     assert approve_attempt.status_code == 403
@@ -187,7 +197,7 @@ def test_cross_tenant_idor_isolation_returns_404_across_all_endpoints(world: See
     assert (
         world.client.post(
             f"/v1/orders/{oid}/approve-margin",
-            headers=_auth(world.bravo_admin_token, "idem-bravo-appr-01"),
+            headers=_auth(world.bravo_admin_token, "idem-order-4444"),
             json={"expected_version": 1, "reason": "Cross-tenant probe"},
         ).status_code
         == 404
@@ -195,7 +205,7 @@ def test_cross_tenant_idor_isolation_returns_404_across_all_endpoints(world: See
     assert (
         world.client.patch(
             f"/v1/orders/{oid}/lines/{lid}",
-            headers=_auth(world.bravo_admin_token, "idem-bravo-amend-01"),
+            headers=_auth(world.bravo_admin_token, "idem-order-5555"),
             json={"expected_version": 1, "unit_price_minor": 9_000},
         ).status_code
         == 404
@@ -237,7 +247,7 @@ def test_http_idempotency_replay_header_and_409_payload_mismatch(world: SeededWo
 def test_http_rejects_floating_point_json_and_injected_tenant_id(world: SeededWorld) -> None:
     float_resp = world.client.post(
         "/v1/orders",
-        headers=_auth(world.sales_rep_token, "idem-float-reject-01"),
+        headers=_auth(world.sales_rep_token, "idem-order-6666"),
         json={
             "customer_ref": "FLOAT-ATTEMPT",
             "currency": "GBP",
@@ -293,7 +303,7 @@ def test_full_http_lifecycle_approval_confirm_and_adverse_amendment_rehold(
     # 3. Finance controller approves under four-eyes control
     approved = world.client.post(
         f"/v1/orders/{oid}/approve-margin",
-        headers=_auth(world.approver_token, "idem-lc-approve-01"),
+        headers=_auth(world.approver_token, "idem-order-7777"),
         json={"expected_version": 1, "reason": "Approved volume introductory pricing."},
     )
     assert approved.status_code == 200
@@ -400,7 +410,14 @@ def test_webhook_endpoint_deduplicates_replay_and_runs_handler_strictly_once(
     )
     raw = b'{"invoice_id":"inv_77","paid":true}'
     ts = str(int(time.time()))
-    sig = compute_webhook_signature(world.container.webhook_secret, ts, raw)
+    sig = compute_webhook_signature(
+        world.container.webhook_secret,
+        ts,
+        raw,
+        provider="erp_payments",
+        tenant_id=TENANT_ALPHA,
+        event_id="evt_dedup_77",
+    )
     headers = {
         "X-Webhook-Timestamp": ts,
         "X-Webhook-Signature": sig,
@@ -415,6 +432,93 @@ def test_webhook_endpoint_deduplicates_replay_and_runs_handler_strictly_once(
     assert r2.status_code == 200
     assert r2.json()["status"] == "duplicate_ignored"
     assert invocations == ["erp_payments:evt_dedup_77"]
+
+
+def test_edge_body_size_limit_duplicate_headers_and_webhook_rollback(
+    world: SeededWorld,
+) -> None:
+    # 1. Duplicate X-Forwarded-For appends trusted rightmost hop (SEC-03)
+    # Send forged IP first, proxy-appended IP second -> must ban real IP, never forged IP!
+    forged_first = [
+        ("x-forwarded-for", "203.0.113.10"),
+        ("x-forwarded-for", "198.51.100.222"),
+    ]
+    trap = world.client.get("///.ENV", headers=forged_first)
+    assert trap.status_code == 403
+    assert trap.json()["error"]["code"] == "SCANNER_IP_BANNED"
+
+    # Real IP 198.51.100.222 is banned even without spoofed header; 203.0.113.10 is untouched
+    assert (
+        world.client.get("/v1/orders", headers={"x-forwarded-for": "198.51.100.222"}).status_code
+        == 403
+    )
+    assert (
+        world.client.get("/v1/orders", headers={"x-forwarded-for": "203.0.113.10"}).status_code
+        == 401
+    )
+
+    # Duplicate Authorization headers rejected immediately with 400 DUPLICATE_AUTH_HEADER (SEC-03)
+    dup_auth = world.client.get(
+        "/v1/orders",
+        headers=[
+            ("authorization", f"Bearer {world.sales_rep_token}"),
+            ("authorization", f"Bearer {world.approver_token}"),
+        ],
+    )
+    assert dup_auth.status_code == 400
+    assert dup_auth.json()["error"]["code"] == "DUPLICATE_AUTH_HEADER"
+
+    # 2. Oversized HTTP payload rejected at ASGI edge with 413 PAYLOAD_TOO_LARGE (SEC-05)
+    oversized = world.client.post(
+        "/v1/orders",
+        headers={
+            "Authorization": f"Bearer {world.sales_rep_token}",
+            "Content-Type": "application/json",
+        },
+        content=b'{"customer_ref":"' + (b"A" * 300_000) + b'"}',
+    )
+    assert oversized.status_code == 413
+    assert oversized.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
+
+    # 3. Webhook handler failure releases dedup claim so retry succeeds (SEC-13)
+    attempts = 0
+
+    def flaky_handler(_prov: str, _ev: str, _tid: Any, _body: bytes) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("Transient downstream timeout")
+
+    world.container.webhook_handlers.append(flaky_handler)
+    raw = b'{"invoice_id":"inv_retry_1"}'
+    ts = str(int(time.time()))
+    sig = compute_webhook_signature(
+        world.container.webhook_secret,
+        ts,
+        raw,
+        provider="erp_retry",
+        tenant_id=TENANT_ALPHA,
+        event_id="evt_retry_1",
+    )
+    wh_headers = {
+        "X-Webhook-Timestamp": ts,
+        "X-Webhook-Signature": sig,
+        "X-Webhook-Event-Id": "evt_retry_1",
+        "X-Webhook-Tenant-Id": str(TENANT_ALPHA),
+    }
+    non_raising_client = TestClient(
+        create_app(world.container),
+        client=("127.0.0.1", 50000),
+        raise_server_exceptions=False,
+    )
+    first_try = non_raising_client.post("/v1/webhooks/erp_retry", content=raw, headers=wh_headers)
+    assert first_try.status_code == 500
+    assert "Transient downstream timeout" not in first_try.text
+    # Verify claim was released by retrying cleanly
+    second_try = world.client.post("/v1/webhooks/erp_retry", content=raw, headers=wh_headers)
+    assert second_try.status_code == 200
+    assert second_try.json()["status"] == "processed"
+    assert attempts == 2
 
 
 def _mcp_call(
@@ -508,7 +612,7 @@ def test_mcp_server_tools_list_and_full_domain_rbac_parity(world: SeededWorld) -
         world.approver_token,
         "approve_margin",
         {
-            "idempotency_key": "mcp-idem-approve-01",
+            "idempotency_key": "idem-order-8888",
             "order_id": oid,
             "expected_version": 1,
             "reason": "MCP finance controller sign-off.",

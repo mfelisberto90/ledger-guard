@@ -1,10 +1,4 @@
-"""Native Model Context Protocol `stdio` JSON-RPC 2.0 server entrypoint.
-
-Runs an isolated in-memory B2B ledger sandbox by default under least-privilege role
-`sales_rep` (zero supplier cost or margin disclosure, zero network sockets, zero external
-environment secrets required) so MCP clients, Claude Desktop, Cursor, and automated MCP
-verifiers can inspect and exercise all 7 tools over standard input/output.
-"""
+"""Native Model Context Protocol `stdio` JSON-RPC 2.0 server entrypoint."""
 
 from __future__ import annotations
 
@@ -12,121 +6,63 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from fractions import Fraction
 from typing import BinaryIO, TextIO
-from uuid import UUID
 
-from ledger_guard.api.app import AppContainer
-from ledger_guard.domain.margin_gate import MarginPolicy, PrincipalContext
-from ledger_guard.domain.money import Currency, UnitRatio
-from ledger_guard.domain.pricing import ItemKind, QuantityTierDiscount
-from ledger_guard.mcp.server import SERVER_VERSION
-from ledger_guard.ports import CatalogItem
+from ledger_guard import __version__ as SERVER_VERSION
+from ledger_guard.adapters.in_memory import (
+    InMemoryAuditOutbox,
+    InMemoryCatalogAdapter,
+    InMemoryIdempotencyStore,
+    InMemoryOrderRepository,
+    InMemoryPolicyRepository,
+    InMemoryValuationAdapter,
+)
+from ledger_guard.application.order_service import OrderService
+from ledger_guard.application.sandbox import ROLE_CAPABILITIES, seed_reference_sandbox
+from ledger_guard.domain.margin_gate import PrincipalContext
+from ledger_guard.mcp.server import McpToolServer
+from ledger_guard.security.auth import MembershipDirectory
+from ledger_guard.security.idempotency import IdempotencyCoordinator
+from ledger_guard.security.redaction import Redactor
 
-SANDBOX_TENANT_ID: UUID = UUID("00000000-0000-4000-8000-000000000101")
-
-ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
-    "warehouse": frozenset({"orders:read"}),
-    "sales_rep": frozenset(
-        {"orders:read", "orders:write", "orders:confirm", "orders:export"}
-    ),
-    "finance_approver": frozenset(
-        {
-            "orders:read",
-            "orders:margin:read",
-            "orders:margin:approve",
-            "orders:confirm",
-            "orders:export",
-        }
-    ),
-    "owner": frozenset(
-        {
-            "orders:read",
-            "orders:write",
-            "orders:confirm",
-            "orders:export",
-            "orders:margin:read",
-            "orders:margin:approve",
-            "valuation:cost:read",
-        }
-    ),
-}
+MAX_STDIO_FRAME_BYTES: int = 1_048_576
+MAX_STDIO_HEADER_LINES: int = 32
 
 
-def build_sandbox_container() -> tuple[AppContainer, dict[str, PrincipalContext]]:
-    """Construct a deterministic, zero-I/O in-memory sandbox seeded with sample B2B SKUs."""
-    container = AppContainer()
-    container.policies.save_policy(
-        SANDBOX_TENANT_ID,
-        MarginPolicy(
-            tenant_id=SANDBOX_TENANT_ID,
-            mode="block",
-            minimum_margin_bps=2_000,
-        ),
+def build_stdio_mcp_server(
+    *,
+    seed_pending_order: bool = True,
+) -> tuple[McpToolServer, dict[str, PrincipalContext], dict[str, object] | None]:
+    """Construct an isolated, zero-HTTP-import in-memory MCP tool server and sandbox."""
+    catalog = InMemoryCatalogAdapter()
+    valuation = InMemoryValuationAdapter()
+    policies = InMemoryPolicyRepository()
+    outbox = InMemoryAuditOutbox()
+    orders = InMemoryOrderRepository(outbox)
+    idempotency_store = InMemoryIdempotencyStore()
+    memberships = MembershipDirectory()
+    redactor = Redactor()
+
+    order_service = OrderService(
+        catalog=catalog,
+        valuation=valuation,
+        orders=orders,
+        policies=policies,
     )
-
-    container.catalog.upsert_item(
-        SANDBOX_TENANT_ID,
-        CatalogItem(
-            sku="VALVE-DN50",
-            description="Stainless Steel Ball Valve DN50 PN40",
-            item_kind=ItemKind.STOCKED,
-            currency=Currency.GBP,
-            list_unit_price_minor=10_000,
-            unit_ratio=UnitRatio(1, 1),
-            tier_discounts=(QuantityTierDiscount(Fraction(10, 1), 500),),
-        ),
+    mcp_server = McpToolServer(
+        order_service=order_service,
+        idempotency=IdempotencyCoordinator(idempotency_store),
+        redactor=redactor,
     )
-    container.valuation.set_stock_cost(
-        SANDBOX_TENANT_ID,
-        "VALVE-DN50",
-        7_000,
-        Currency.GBP,
+    principals, pending_order = seed_reference_sandbox(
+        catalog=catalog,
+        valuation=valuation,
+        policies=policies,
+        memberships=memberships,
+        orders=orders,
+        seed_pending_order=seed_pending_order,
     )
-
-    container.catalog.upsert_item(
-        SANDBOX_TENANT_ID,
-        CatalogItem(
-            sku="REAGENT-BTL",
-            description="Analytical Grade Buffer Bottle (1/3 Case Split)",
-            item_kind=ItemKind.STOCKED,
-            currency=Currency.GBP,
-            list_unit_price_minor=450,
-            unit_ratio=UnitRatio(1, 3),
-        ),
-    )
-    container.valuation.set_stock_cost(
-        SANDBOX_TENANT_ID,
-        "REAGENT-BTL",
-        900,
-        Currency.GBP,
-    )
-
-    container.catalog.upsert_item(
-        SANDBOX_TENANT_ID,
-        CatalogItem(
-            sku="INSTALL-SVC",
-            description="On-Site Commissioning Service Visit",
-            item_kind=ItemKind.SERVICE,
-            currency=Currency.GBP,
-            list_unit_price_minor=25_000,
-            unit_ratio=UnitRatio(1, 1),
-        ),
-    )
-
-    principals: dict[str, PrincipalContext] = {}
-    for role_name, caps in ROLE_CAPABILITIES.items():
-        principal = PrincipalContext(
-            principal_id=f"stdio.{role_name}@sandbox.ledgerguard.local",
-            tenant_id=SANDBOX_TENANT_ID,
-            role=role_name,
-            capabilities=caps,
-            is_active=True,
-        )
-        container.memberships.register_member(principal)
-        principals[role_name] = principal
-
-    return container, principals
+    return mcp_server, principals, pending_order
 
 
 def _write_response(
@@ -144,19 +80,47 @@ def _write_response(
     stdout.flush()
 
 
+def _read_exact_bytes(stream: BinaryIO, count: int) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def serve_stdio_stream(
     stdin_bytes: BinaryIO,
     stdout_text: TextIO,
     *,
     role: str = "sales_rep",
+    seed_pending_order: bool = True,
 ) -> int:
-    """Process MCP JSON-RPC 2.0 frames over `stdio` (newline JSON and Content-Length)."""
-    container, principals = build_sandbox_container()
+    """Process bounded MCP JSON-RPC 2.0 frames over `stdio`."""
+    mcp_server, principals, _ = build_stdio_mcp_server(seed_pending_order=seed_pending_order)
     principal = principals[role]
+    max_line_read = MAX_STDIO_FRAME_BYTES + 1
 
     while True:
-        first_line = stdin_bytes.readline()
+        first_line = stdin_bytes.readline(max_line_read)
         if not first_line:
+            break
+        if len(first_line) > MAX_STDIO_FRAME_BYTES and not first_line.endswith(b"\n"):
+            _write_response(
+                stdout_text,
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": "Invalid Request: frame exceeds maximum allowed size.",
+                    },
+                },
+                use_content_length=False,
+            )
             break
 
         stripped = first_line.strip()
@@ -180,19 +144,46 @@ def serve_stdio_stream(
                 )
                 continue
 
+            header_count = 0
+            header_limit_exceeded = False
             while True:
-                header_line = stdin_bytes.readline()
+                header_line = stdin_bytes.readline(max_line_read)
+                header_count += 1
                 if not header_line or header_line in (b"\r\n", b"\n"):
                     break
-            raw_body = stdin_bytes.read(length_val)
-            if not raw_body:
+                if header_count >= MAX_STDIO_HEADER_LINES or len(header_line) > 8_192:
+                    header_limit_exceeded = True
+                    break
+
+            if header_limit_exceeded or length_val <= 0 or length_val > MAX_STDIO_FRAME_BYTES:
+                _write_response(
+                    stdout_text,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": (
+                                "Invalid Request: Content-Length must be in "
+                                f"1..{MAX_STDIO_FRAME_BYTES}."
+                            ),
+                        },
+                    },
+                    use_content_length=True,
+                )
+                if length_val > MAX_STDIO_FRAME_BYTES or length_val < 0:
+                    break
+                continue
+
+            raw_body = _read_exact_bytes(stdin_bytes, length_val)
+            if raw_body is None:
                 break
         else:
             raw_body = stripped
 
         try:
             decoded_obj = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             _write_response(
                 stdout_text,
                 {
@@ -216,7 +207,20 @@ def serve_stdio_stream(
             )
             continue
 
-        response = container.mcp_server.handle_jsonrpc(principal, decoded_obj)
+        try:
+            response = mcp_server.handle_jsonrpc(principal, decoded_obj)
+        except Exception:
+            err_id = (
+                decoded_obj.get("id")
+                if isinstance(decoded_obj.get("id"), (int, str))
+                else None
+            )
+            response = {
+                "jsonrpc": "2.0",
+                "id": err_id,
+                "error": {"code": -32603, "message": "Internal JSON-RPC execution error."},
+            }
+
         if response is not None:
             _write_response(
                 stdout_text,

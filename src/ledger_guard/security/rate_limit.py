@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import threading
 import time
 from collections import OrderedDict
@@ -25,10 +26,6 @@ class BoundedMap[K, V]:
         self._max_entries = max_entries
         self._lock = threading.RLock()
         self._data: OrderedDict[K, V] = OrderedDict()
-
-    @property
-    def max_entries(self) -> int:
-        return self._max_entries
 
     def __len__(self) -> int:
         with self._lock:
@@ -59,6 +56,10 @@ class BoundedMap[K, V]:
         with self._lock:
             return list(self._data.keys())
 
+    def values_snapshot(self) -> list[V]:
+        with self._lock:
+            return list(self._data.values())
+
 
 @dataclass(slots=True)
 class _WindowCounter:
@@ -73,36 +74,49 @@ class _StrikeState:
     expires_at: float
 
 
-class HmacMultiBucketRateLimiter:
-    """Multi-bucket HMAC-SHA256 rate limiter with progressive principal strike lockouts.
+def normalize_rate_limit_ip(client_ip: str) -> str:
+    """Normalize client IPs, grouping IPv6 addresses by `/64` prefix to block subnet evasion."""
+    clean_ip = client_ip.strip()
+    if not clean_ip:
+        return "unknown_ip"
+    try:
+        parsed = ipaddress.ip_address(clean_ip)
+    except ValueError:
+        return clean_ip
+    if parsed.version == 6:
+        net = ipaddress.ip_network(f"{parsed}/64", strict=False)
+        return str(net)
+    return str(parsed)
 
-    - Keys are hashed with `HMAC-SHA256(secret_key, raw)` so plain emails, user IDs,
-      and client IPs are never stored in memory or cache snapshots.
-    - Buckets:
-        * `principal`: default `5 / 60s` + progressive lockout (`60s..86400s`)
-        * `ip`: default `60 / 60s`
-        * `tenant_ip`: default `120 / 60s`
-    - `clear_principal_on_login` resets ONLY the principal & strike buckets, strictly
-      preserving the `ip` bucket to block distributed-account password spraying (`AUTH-ABUSE-02`).
-    """
+
+class HmacMultiBucketRateLimiter:
+    """Multi-bucket HMAC-SHA256 rate limiter with tenant-scoped progressive lockouts."""
 
     def __init__(
         self,
         secret_key: bytes,
         *,
         principal_limit_per_min: int = 5,
+        authenticated_principal_limit_per_min: int = 120,
         ip_limit_per_min: int = 60,
         tenant_ip_limit_per_min: int = 120,
+        tenant_limit_per_min: int = 240,
         max_entries: int = 10_000,
     ) -> None:
         if len(secret_key) < 16:
             raise ValidationError("Rate limiter HMAC key must be at least 16 bytes.")
         self._key = secret_key
         self._principal_limit = principal_limit_per_min
+        self._auth_principal_limit = authenticated_principal_limit_per_min
         self._ip_limit = ip_limit_per_min
         self._tenant_ip_limit = tenant_ip_limit_per_min
+        self._tenant_limit = tenant_limit_per_min
         self._lock = threading.RLock()
-        self._windows: BoundedMap[str, _WindowCounter] = BoundedMap(max_entries=max_entries)
+        self._ip_windows: BoundedMap[str, _WindowCounter] = BoundedMap(max_entries=max_entries)
+        self._tenant_windows: BoundedMap[str, _WindowCounter] = BoundedMap(max_entries=max_entries)
+        self._principal_windows: BoundedMap[str, _WindowCounter] = BoundedMap(
+            max_entries=max_entries
+        )
         self._strikes: BoundedMap[str, _StrikeState] = BoundedMap(max_entries=max_entries)
 
     def derive_bucket_key(self, prefix: str, raw_identifier: str) -> str:
@@ -113,25 +127,38 @@ class HmacMultiBucketRateLimiter:
         ).hexdigest()
         return f"{prefix}_{digest}"
 
-    def stored_keys_snapshot(self) -> list[str]:
-        return self._windows.keys_snapshot() + self._strikes.keys_snapshot()
+    @staticmethod
+    def _principal_scope(tenant_id: str | None, principal_id: str) -> str:
+        norm_principal = normalize_principal_id(principal_id)
+        scope_tid = tenant_id.strip().lower() if tenant_id else "global"
+        return f"{scope_tid}:{norm_principal}"
 
+    def stored_keys_snapshot(self) -> list[str]:
+        with self._lock:
+            return (
+                self._ip_windows.keys_snapshot()
+                + self._tenant_windows.keys_snapshot()
+                + self._principal_windows.keys_snapshot()
+                + self._strikes.keys_snapshot()
+            )
+
+    @staticmethod
     def _consume_window(
-        self,
+        bucket_map: BoundedMap[str, _WindowCounter],
         bucket_key: str,
         limit: int,
         window_seconds: int,
         now: float,
     ) -> tuple[bool, int]:
-        counter = self._windows.get(bucket_key)
+        counter = bucket_map.get(bucket_key)
         if counter is None or now >= counter.reset_at:
-            self._windows.set(bucket_key, _WindowCounter(count=1, reset_at=now + window_seconds))
+            bucket_map.set(bucket_key, _WindowCounter(count=1, reset_at=now + window_seconds))
             return True, 0
         if counter.count >= limit:
             retry_after = max(1, int(counter.reset_at - now + 0.999))
             return False, retry_after
         counter.count += 1
-        self._windows.set(bucket_key, counter)
+        bucket_map.set(bucket_key, counter)
         return True, 0
 
     def check_request(
@@ -143,15 +170,15 @@ class HmacMultiBucketRateLimiter:
         enforce_principal_bucket: bool = True,
         now: float | None = None,
     ) -> None:
-        """Evaluate applicable rate-limit buckets in canonical order."""
+        """Evaluate applicable rate-limit buckets in fail-closed order."""
         ts = time.monotonic() if now is None else now
-        clean_ip = client_ip.strip() or "unknown_ip"
+        clean_ip = normalize_rate_limit_ip(client_ip)
 
         with self._lock:
-            # 1. Check active strike lockout on principal first
-            if enforce_principal_bucket and principal_id is not None:
-                norm_principal = normalize_principal_id(principal_id)
-                strike_key = self.derive_bucket_key("rl_strikes", norm_principal)
+            # 1. Always enforce active strike lockout for any identified principal
+            if principal_id is not None:
+                p_scope = self._principal_scope(tenant_id, principal_id)
+                strike_key = self.derive_bucket_key("rl_strikes", p_scope)
                 strike_state = self._strikes.get(strike_key)
                 if strike_state is not None:
                     if ts >= strike_state.expires_at:
@@ -166,7 +193,9 @@ class HmacMultiBucketRateLimiter:
 
             # 2. Check IP bucket (60/min)
             ip_key = self.derive_bucket_key("rl_ip", clean_ip)
-            ip_ok, ip_retry = self._consume_window(ip_key, self._ip_limit, 60, ts)
+            ip_ok, ip_retry = self._consume_window(
+                self._ip_windows, ip_key, self._ip_limit, 60, ts
+            )
             if not ip_ok:
                 raise RateLimitExceededError(
                     "IP request rate limit exceeded.",
@@ -174,11 +203,11 @@ class HmacMultiBucketRateLimiter:
                     bucket="ip",
                 )
 
-            # 3. Check Tenant+IP bucket (120/min)
+            # 3. Check Tenant+IP and Tenant-wide buckets
             if tenant_id is not None:
                 t_ip_key = self.derive_bucket_key("rl_tenant_ip", f"{tenant_id}:{clean_ip}")
                 tip_ok, tip_retry = self._consume_window(
-                    t_ip_key, self._tenant_ip_limit, 60, ts
+                    self._tenant_windows, t_ip_key, self._tenant_ip_limit, 60, ts
                 )
                 if not tip_ok:
                     raise RateLimitExceededError(
@@ -187,39 +216,69 @@ class HmacMultiBucketRateLimiter:
                         bucket="tenant_ip",
                     )
 
-            # 4. Check Principal bucket (5/min) + escalate exponential strike lockout
-            if enforce_principal_bucket and principal_id is not None:
-                norm_principal = normalize_principal_id(principal_id)
-                p_key = self.derive_bucket_key("rl_principal", norm_principal)
-                p_ok, _ = self._consume_window(p_key, self._principal_limit, 60, ts)
-                if not p_ok:
-                    strike_key = self.derive_bucket_key("rl_strikes", norm_principal)
-                    existing = self._strikes.get(strike_key)
-                    if existing is None or ts >= existing.expires_at:
-                        next_strikes = 1
-                    else:
-                        next_strikes = existing.strikes + 1
-                    schedule_idx = min(
-                        next_strikes - 1, len(LOCKOUT_STRIKE_SCHEDULE_SECONDS) - 1
-                    )
-                    lockout_secs = LOCKOUT_STRIKE_SCHEDULE_SECONDS[schedule_idx]
-                    self._strikes.set(
-                        strike_key,
-                        _StrikeState(
-                            strikes=next_strikes,
-                            locked_until=ts + lockout_secs,
-                            expires_at=ts + STRIKE_RETENTION_SECONDS,
-                        ),
-                    )
+                t_key = self.derive_bucket_key("rl_tenant", tenant_id)
+                t_ok, t_retry = self._consume_window(
+                    self._tenant_windows, t_key, self._tenant_limit, 60, ts
+                )
+                if not t_ok:
                     raise RateLimitExceededError(
-                        "Principal rate limit exceeded; progressive lockout engaged.",
-                        retry_after_seconds=lockout_secs,
-                        bucket="principal",
+                        "Tenant request rate limit exceeded.",
+                        retry_after_seconds=t_retry,
+                        bucket="tenant",
                     )
 
-    def clear_principal_on_login(self, principal_id: str) -> None:
-        """Reset principal & strike counters after valid login while preserving IP bucket."""
-        norm_principal = normalize_principal_id(principal_id)
+            # 4. Check Principal bucket (strict login 5/min + strike escalation, or auth quota)
+            if principal_id is not None:
+                p_scope = self._principal_scope(tenant_id, principal_id)
+                if enforce_principal_bucket:
+                    p_key = self.derive_bucket_key("rl_principal", p_scope)
+                    p_ok, _ = self._consume_window(
+                        self._principal_windows, p_key, self._principal_limit, 60, ts
+                    )
+                    if not p_ok:
+                        strike_key = self.derive_bucket_key("rl_strikes", p_scope)
+                        existing = self._strikes.get(strike_key)
+                        if existing is None or ts >= existing.expires_at:
+                            next_strikes = 1
+                        else:
+                            next_strikes = existing.strikes + 1
+                        schedule_idx = min(
+                            next_strikes - 1, len(LOCKOUT_STRIKE_SCHEDULE_SECONDS) - 1
+                        )
+                        lockout_secs = LOCKOUT_STRIKE_SCHEDULE_SECONDS[schedule_idx]
+                        self._strikes.set(
+                            strike_key,
+                            _StrikeState(
+                                strikes=next_strikes,
+                                locked_until=ts + lockout_secs,
+                                expires_at=ts + STRIKE_RETENTION_SECONDS,
+                            ),
+                        )
+                        raise RateLimitExceededError(
+                            "Principal rate limit exceeded; progressive lockout engaged.",
+                            retry_after_seconds=lockout_secs,
+                            bucket="principal",
+                        )
+                else:
+                    auth_p_key = self.derive_bucket_key("rl_auth_principal", p_scope)
+                    auth_ok, auth_retry = self._consume_window(
+                        self._principal_windows, auth_p_key, self._auth_principal_limit, 60, ts
+                    )
+                    if not auth_ok:
+                        raise RateLimitExceededError(
+                            "Authenticated principal rate limit exceeded.",
+                            retry_after_seconds=auth_retry,
+                            bucket="principal",
+                        )
+
+    def clear_principal_on_login(
+        self,
+        principal_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> None:
+        """Reset tenant-scoped principal & strike counters while preserving IP spray bucket."""
+        p_scope = self._principal_scope(tenant_id, principal_id)
         with self._lock:
-            self._windows.delete(self.derive_bucket_key("rl_principal", norm_principal))
-            self._strikes.delete(self.derive_bucket_key("rl_strikes", norm_principal))
+            self._principal_windows.delete(self.derive_bucket_key("rl_principal", p_scope))
+            self._strikes.delete(self.derive_bucket_key("rl_strikes", p_scope))
